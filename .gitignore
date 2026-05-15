@@ -1,0 +1,43 @@
+# Build output
+build/
+build*/
+build_out.txt
+build_err.txt
+build_log.txt
+
+# ESP-IDF build artifacts
+partitions.bin
+firmware_*.bin
+header_check.bin
+idf_check.bin
+test_*.bin
+_serial_dump.bin
+dependencies.lock
+
+# IDE & editor
+.vscode/
+.clangd
+.cache/
+
+# Temporary scripts
+_capture_*.py
+_debug_serial.py
+_quick_cap.py
+_tmp_monitor.py
+_verify_serial.py
+_capture_raw.py
+
+# Build scripts
+_build*.bat
+_build*.ps1
+
+# Config (may contain secrets)
+sdkconfig
+sdkconfig.old
+
+# Backup files
+PATH_backup.txt
+System_PATH_Backup_*.txt
+
+# Managed components (external dependencies)
+managed_components/
