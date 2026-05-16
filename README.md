@@ -99,8 +99,10 @@ esp_netif_set_dns_info(netif, ESP_NETIF_DNS_MAIN, &dns);
 ```
 
 且必须在 `esp_netif_dhcps_stop()` 和 `esp_netif_dhcps_start()` 之间执行。
-<img width="780" height="4460" alt="3019ee298b7ac1e1f8f661ceeb5a48eb" src="https://github.com/user-attachments/assets/2c662b61-ee73-4452-9cf6-a26b57196296" />
 
 ### NAPT 线程安全
 
 `ip_napt_enable_netif()` 必须通过 `tcpip_callback()` 在 lwIP TCP/IP 线程中调用，直接从事件处理线程调用会导致 NAT 表损坏。
+<div align="center">
+    <img src="https://github.com/user-attachments/assets/2c662b61-ee73-4452-9cf6-a26b57196296" width="780" />
+</div>
