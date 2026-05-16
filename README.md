@@ -1,3 +1,4 @@
+<img width="780" height="4460" alt="3019ee298b7ac1e1f8f661ceeb5a48eb" src="https://github.com/user-attachments/assets/2c662b61-ee73-4452-9cf6-a26b57196296" />
 # ESP32-S3 WiFi 路由器
 
 ESP32-S3 实现三接口网络共享，支持 STA/AP/USB 同时运行，STA 作为上游，AP 和 USB 作为下游，通过 NAPT 共享上网。
