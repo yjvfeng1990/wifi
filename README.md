@@ -160,4 +160,4 @@ esp_netif_set_dns_info(netif, ESP_NETIF_DNS_MAIN, &dns);
 
 ## Web 管理页面
 
-![Web管理页面截图](https://github.com/user-attachments/assets/ff37252e-347e-4b3d-bf65-308be6c9870e)
+![Web管理页面截图](https://github.com/user-attachments/assets/84edbc7a-35da-4130-a8a9-f65c49cefab8)
