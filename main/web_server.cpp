@@ -51,8 +51,9 @@ static esp_err_t root_get_handler(httpd_req_t* req)
         .rssi-bad{background:linear-gradient(90deg,#ff4444,#cc2222)}
         .form-group{margin-bottom:14px}
         label{display:block;margin-bottom:6px;color:#8892b0;font-size:13px;font-weight:500}
-        input[type="text"],input[type="password"]{width:100%;padding:12px 15px;background:rgba(255,255,255,0.05);border:1px solid rgba(255,255,255,0.1);border-radius:8px;color:#e0e0e0;font-size:15px;transition:all 0.3s}
+        input[type="text"],input[type="password"]{width:100%;padding:12px 15px;background:rgba(255,255,255,0.05);border:1px solid rgba(255,255,255,0.1);border-radius:8px;color:#e0e0e0;font-size:15px;transition:all 0.3s;-webkit-text-fill-color:#e0e0e0}
         input:focus{outline:none;border-color:#e94560;box-shadow:0 0 0 3px rgba(233,69,96,0.15)}
+        input:-webkit-autofill,input:-webkit-autofill:hover,input:-webkit-autofill:focus,input:-webkit-autofill:active{-webkit-box-shadow:0 0 0 30px #1a1f36 inset !important;-webkit-text-fill-color:#e0e0e0 !important;transition:background-color 5000s ease-in-out 0s}
         .btn{width:100%;padding:13px;border:none;border-radius:8px;font-size:15px;font-weight:600;cursor:pointer;transition:all 0.3s;text-transform:uppercase;letter-spacing:0.5px}
         .btn-primary{background:linear-gradient(135deg,#e94560,#c23152);color:white}
         .btn-primary:hover{transform:translateY(-1px);box-shadow:0 6px 20px rgba(233,69,96,0.3)}
