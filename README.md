@@ -104,4 +104,60 @@ python -m esptool --chip esp32s3 -p COM2 -b 460800 --before default-reset --afte
 扫描从同步阻塞改为异步轮询模式：
 
 1. 用户点击扫描 → 前端调用 `/api/wifi/scan` → 后端启动独立 FreeRTOS task → 立即返回 `{"scanning":true}`
-2. 前端每 500ms 轮询 `/api/wifi/scan`
+2. 前端每 500ms 轮询 `/api/wifi/scan` → 扫描完成后返回结果 JSON
+3. 页面显示所有 AP，点击自动填入 SSID 输入框
+
+**旧同步方案的致命问题**：`esp_wifi_scan_start(block=true)` 阻塞 HTTP 处理线程 3-5 秒，期间 WiFi 射频跳频导致 STA 连接的 TCP 中断，浏览器收不到响应 → 显示 "No networks found"。
+
+### WIFI_EVENT_SCAN_DONE 结果竞争
+
+之前的代码在 `wifi_service.cpp` 的 WiFi 事件处理器中注册了 `WIFI_EVENT_SCAN_DONE` → `collect_scan_results()`，会抢先消费扫描结果。当 web_server 的异步 scan task 醒来后，`esp_wifi_scan_get_ap_records()` 返回 0 — 所有结果已被事件处理器拿走。修复方法：移除该事件处理分支，让 scan task 独占结果。
+
+### SSID 特殊字符与 HTML 属性注入
+
+SSID 可能包含 `"`、`&`、`'` 和不可见控制字符，直接拼入 HTML `onclick` 属性会破坏 DOM。
+
+- **后端**：`json_escape_ssid()` 函数处理 `"` `\` `\b` `\f` `\n` `\r` `\t` 及 ASCII < 0x20（`\u00XX` 编码）
+- **前端**：SSID 通过 `data-ssid` HTML 属性传递（`"`→`&quot;`），onclick 用 `this.getAttribute('data-ssid')` 取出，避免字符串注入
+
+### updateStatus 覆盖表单字段
+
+`updateStatus()` 每 2 秒轮询 WiFi 状态，之前无条件覆盖 STA/AP 的 SSID 和密码输入框。修复：仅在输入框为空（`!el.value`）时才自动填充，用户手动输入或扫描选中后不受影响。
+
+### 切换 WiFi 重连
+
+切换 SSID 时新增 `esp_wifi_scan_stop()` + `esp_wifi_disconnect()` 两步前置操作，确保无扫描竞争且旧连接完全断开后再设新配置 + 连接。
+
+### HTTPD URI 路由表溢出
+
+`HTTPD_DEFAULT_CONFIG()` 默认 `max_uri_handlers = 8`。当注册超过 8 个路由时，`httpd_register_uri_handler()` 静默失败。手动增大至 `config.max_uri_handlers = 16`。
+
+### DHCP DNS 选项格式（ESP-IDF v6.0.1）
+
+`esp_netif_dhcps_option(ESP_NETIF_DOMAIN_NAME_SERVER)` 的参数类型为 `uint8_t` 标志位（`0x02`），不是 DNS IP 地址。正确用法两步：
+
+```c
+// 1. 启用 DNS 选项（标志位）
+uint8_t dns_enable = 0x02;
+esp_netif_dhcps_option(netif, ESP_NETIF_OP_SET,
+    ESP_NETIF_DOMAIN_NAME_SERVER, &dns_enable, sizeof(dns_enable));
+
+// 2. 设置实际 DNS IP
+esp_netif_dns_info_t dns;
+IP4_ADDR(&dns.ip.u_addr.ip4, 8, 8, 8, 8);
+esp_netif_set_dns_info(netif, ESP_NETIF_DNS_MAIN, &dns);
+```
+
+必须在 `esp_netif_dhcps_stop()` 和 `esp_netif_dhcps_start()` 之间执行。
+
+### NAPT 线程安全
+
+`ip_napt_enable_netif()` 必须通过 `tcpip_callback()` 在 lwIP TCP/IP 线程中调用，直接从事件处理线程调用会导致 NAT 表损坏。
+
+### double-free 崩溃
+
+`esp_netif_receive` 失败后内部已释放 buffer，再手动 `free(buf_copy)` 导致 double-free。修复：移除回调中的 `free(buf_copy)`。
+
+## Web 管理页面
+
+![Web管理页面截图](https://github.com/user-attachments/assets/ff37252e-347e-4b3d-bf65-308be6c9870e)
