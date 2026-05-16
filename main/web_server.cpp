@@ -1,5 +1,4 @@
 #include <stdio.h>
-#include <stdlib.h>
 #include <string.h>
 #include "esp_log.h"
 #include "esp_system.h"
@@ -25,16 +24,17 @@ static esp_err_t root_get_handler(httpd_req_t* req)
     <style>
         *{margin:0;padding:0;box-sizing:border-box}
         body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:linear-gradient(135deg,#1a1a2e 0%,#16213e 50%,#0f3460 100%);min-height:100vh;padding:20px;color:#e0e0e0}
-        .container{max-width:800px;margin:0 auto}
+        .container{max-width:900px;margin:0 auto}
         .header{text-align:center;margin-bottom:30px;padding:30px 0}
         .header h1{font-size:2.2em;color:#e94560;margin-bottom:8px}
         .header p{color:#8892b0;font-size:1.1em}
         .card{background:rgba(255,255,255,0.05);border-radius:16px;padding:24px;margin-bottom:20px;border:1px solid rgba(255,255,255,0.08);backdrop-filter:blur(10px)}
         .card h2{color:#e94560;margin-bottom:16px;font-size:1.2em;display:flex;align-items:center;gap:8px}
-        .card h2 .dot{width:10px;height:10px;border-radius:50%;display:inline-block}
+        .dot{width:10px;height:10px;border-radius:50%;display:inline-block;flex-shrink:0}
         .dot-online{background:#00ff88;box-shadow:0 0 8px #00ff8866}
         .dot-offline{background:#ff4444;box-shadow:0 0 8px #ff444466}
         .dot-connecting{background:#ffaa00;box-shadow:0 0 8px #ffaa0066;animation:pulse 1s infinite}
+        .dot-active{background:#00c8ff;box-shadow:0 0 8px #00c8ff66}
         @keyframes pulse{0%,100%{opacity:1}50%{opacity:0.3}}
         .status-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:12px;margin-top:12px}
         .status-item{background:rgba(255,255,255,0.03);padding:14px;border-radius:10px;border:1px solid rgba(255,255,255,0.05)}
@@ -45,10 +45,6 @@ static esp_err_t root_get_handler(httpd_req_t* req)
         .rssi-good{background:linear-gradient(90deg,#00ff88,#00cc6a)}
         .rssi-ok{background:linear-gradient(90deg,#ffaa00,#ff8800)}
         .rssi-bad{background:linear-gradient(90deg,#ff4444,#cc2222)}
-        .mode-toggle{display:flex;gap:10px;margin-bottom:16px}
-        .mode-btn{flex:1;padding:12px;border:2px solid rgba(255,255,255,0.1);border-radius:10px;background:rgba(255,255,255,0.03);color:#8892b0;font-size:14px;font-weight:600;cursor:pointer;transition:all 0.3s;text-align:center}
-        .mode-btn.active{border-color:#e94560;background:rgba(233,69,96,0.1);color:#e94560}
-        .mode-btn:hover{border-color:rgba(233,69,96,0.4)}
         .form-group{margin-bottom:14px}
         label{display:block;margin-bottom:6px;color:#8892b0;font-size:13px;font-weight:500}
         input[type="text"],input[type="password"]{width:100%;padding:12px 15px;background:rgba(255,255,255,0.05);border:1px solid rgba(255,255,255,0.1);border-radius:8px;color:#e0e0e0;font-size:15px;transition:all 0.3s}
@@ -59,194 +55,310 @@ static esp_err_t root_get_handler(httpd_req_t* req)
         .btn-primary:disabled{opacity:0.5;cursor:not-allowed;transform:none}
         .btn-outline{background:transparent;color:#e94560;border:2px solid #e94560;margin-top:8px}
         .btn-outline:hover{background:rgba(233,69,96,0.1)}
+        .btn-ap-start{background:linear-gradient(135deg,#00c8ff,#0090cc);color:white;margin-bottom:8px}
+        .btn-ap-start:hover{transform:translateY(-1px);box-shadow:0 6px 20px rgba(0,200,255,0.3)}
         .btn-danger{background:rgba(255,68,68,0.15);color:#ff6666;margin-top:8px}
         .btn-danger:hover{background:rgba(255,68,68,0.25)}
-        .section-ap{display:none}
-        .section-ap.show{display:block}
-        .section-sta{display:none}
-        .section-sta.show{display:block}
         .toast{position:fixed;top:20px;right:20px;padding:14px 20px;border-radius:10px;color:white;font-weight:500;z-index:999;animation:slideIn 0.3s ease;display:none}
         .toast-success{background:rgba(0,255,136,0.15);border:1px solid rgba(0,255,136,0.3);color:#00ff88}
         .toast-error{background:rgba(255,68,68,0.15);border:1px solid rgba(255,68,68,0.3);color:#ff6666}
         @keyframes slideIn{from{transform:translateX(100px);opacity:0}to{transform:translateX(0);opacity:1}}
         .ip-box{background:rgba(233,69,96,0.1);border:1px solid rgba(233,69,96,0.2);padding:10px 15px;border-radius:8px;font-family:monospace;margin-top:8px}
-        .badge{display:inline-block;padding:3px 10px;border-radius:20px;font-size:12px;font-weight:600}
+        .badge{display:inline-block;padding:3px 10px;border-radius:20px;font-size:11px;font-weight:600}
         .badge-ap{background:rgba(0,200,255,0.15);color:#00c8ff}
         .badge-sta{background:rgba(0,255,136,0.15);color:#00ff88}
-        @media(max-width:600px){.header h1{font-size:1.6em}.status-grid{grid-template-columns:1fr 1fr}}
+        .badge-apsta{background:rgba(200,100,255,0.15);color:#c864ff}
+        .mode-row{display:flex;gap:8px;align-items:center;margin-bottom:10px;flex-wrap:wrap}
+        .thr-col{flex:1;min-width:120px;text-align:center}
+        .thr-title{font-size:12px;color:#8892b0;margin-bottom:10px;text-transform:uppercase;letter-spacing:1px}
+        .thr-row{display:flex;justify-content:center;gap:16px}
+        .thr-dir{font-size:13px;margin-bottom:4px}
+        .thr-val{font-size:16px;font-weight:600;font-family:monospace;transition:color 0.5s}
+        .thr-bar-wrap{height:3px;background:rgba(255,255,255,0.08);border-radius:2px;margin:8px 0;overflow:hidden}
+        .thr-bar{height:100%;border-radius:2px;transition:width 0.8s ease}
+        .thr-rx{background:linear-gradient(90deg,#00ff88,#00cc6a)}
+        .thr-tx{background:linear-gradient(90deg,#e94560,#ff6b6b)}
+        .thr-sep{width:1px;background:rgba(255,255,255,0.1);margin:0 8px}
+        .thr-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:16px}
+        @media(max-width:600px){.header h1{font-size:1.6em}.status-grid{grid-template-columns:1fr 1fr}.thr-grid{grid-template-columns:1fr}}
     </style>
 </head>
 <body>
     <div class="container">
         <div class="header">
             <h1>ESP32-S3 WiFi Manager</h1>
-            <p>USB Network + WiFi AP/STA Configuration</p>
+            <p>USB Network + WiFi AP/STA Dual Mode</p>
         </div>
 
         <div class="card">
-            <h2><span class="dot dot-offline" id="statusDot"></span> WiFi 状态</h2>
-            <div style="margin-bottom:10px"><span class="badge badge-sta" id="modeBadge">STA</span></div>
-            <div class="status-grid">
-                <div class="status-item"><div class="status-label">连接状态</div><div class="status-value" id="wifiState">--</div></div>
-                <div class="status-item"><div class="status-label">WiFi SSID</div><div class="status-value" id="wifiSSID">--</div></div>
-                <div class="status-item"><div class="status-label">WiFi IP</div><div class="status-value" id="wifiIP">--</div></div>
-                <div class="status-item">
-                    <div class="status-label">信号强度</div>
-                    <div class="status-value" id="wifiRSSI">--</div>
-                    <div class="rssi-bar"><div class="rssi-fill" id="rssiBar" style="width:0%"></div></div>
+            <h2>WiFi State</h2>
+            <div class="mode-row">
+                <span class="badge badge-sta" id="modeBadge">STA</span>
+            </div>
+            <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px">
+                <div>
+                    <h2 style="font-size:0.95em;margin-bottom:10px;color:#00ff88">
+                        <span class="dot dot-offline" id="staDot"></span> STA Client
+                    </h2>
+                    <div class="status-grid" style="grid-template-columns:1fr 1fr">
+                        <div class="status-item"><div class="status-label">Status</div><div class="status-value" id="staState">--</div></div>
+                        <div class="status-item"><div class="status-label">SSID</div><div class="status-value" id="staSSID">--</div></div>
+                        <div class="status-item"><div class="status-label">IP</div><div class="status-value" id="staIP">--</div></div>
+                        <div class="status-item">
+                            <div class="status-label">RSSI</div>
+                            <div class="status-value" id="staRSSI">--</div>
+                            <div class="rssi-bar"><div class="rssi-fill" id="rssiBar" style="width:0%"></div></div>
+                        </div>
+                    </div>
+                </div>
+                <div>
+                    <h2 style="font-size:0.95em;margin-bottom:10px;color:#00c8ff">
+                        <span class="dot dot-offline" id="apDot"></span> AP Hotspot
+                    </h2>
+                    <div class="status-grid" style="grid-template-columns:1fr 1fr">
+                        <div class="status-item"><div class="status-label">State</div><div class="status-value" id="apState">Inactive</div></div>
+                        <div class="status-item"><div class="status-label">SSID</div><div class="status-value" id="apSSID">--</div></div>
+                        <div class="status-item"><div class="status-label">IP</div><div class="status-value">192.168.4.1</div></div>
+                        <div class="status-item"><div class="status-label">Clients</div><div class="status-value" id="apClients">0</div></div>
+                    </div>
                 </div>
             </div>
-            <div class="status-item" style="margin-top:10px" id="apClientsBox">
-                <div class="status-label">AP 客户端</div>
-                <div class="status-value" id="apClients">0</div>
+        </div>
+
+        <div class="card">
+            <h2>Real-time Throughput (bytes/s)</h2>
+            <div class="thr-grid">
+                <div style="background:rgba(0,255,136,0.04);border-radius:12px;padding:16px;border:1px solid rgba(0,255,136,0.1)">
+                    <div class="thr-title" style="color:#00ff88">STA (WAN)</div>
+                    <div style="display:flex;justify-content:space-around;gap:8px">
+                        <div style="text-align:center;flex:1">
+                            <div class="thr-dir" style="color:#00ff88">Download</div>
+                            <div class="thr-val" id="staRX">0</div>
+                            <div class="thr-bar-wrap"><div class="thr-bar thr-rx" id="staRXbar" style="width:0%"></div></div>
+                        </div>
+                        <div style="text-align:center;flex:1">
+                            <div class="thr-dir" style="color:#e94560">Upload</div>
+                            <div class="thr-val" id="staTX">0</div>
+                            <div class="thr-bar-wrap"><div class="thr-bar thr-tx" id="staTXbar" style="width:0%"></div></div>
+                        </div>
+                    </div>
+                </div>
+                <div style="background:rgba(0,200,255,0.04);border-radius:12px;padding:16px;border:1px solid rgba(0,200,255,0.1)">
+                    <div class="thr-title" style="color:#00c8ff">AP (LAN)</div>
+                    <div style="display:flex;justify-content:space-around;gap:8px">
+                        <div style="text-align:center;flex:1">
+                            <div class="thr-dir" style="color:#00ff88">Download</div>
+                            <div class="thr-val" id="apRX">0</div>
+                            <div class="thr-bar-wrap"><div class="thr-bar thr-rx" id="apRXbar" style="width:0%"></div></div>
+                        </div>
+                        <div style="text-align:center;flex:1">
+                            <div class="thr-dir" style="color:#e94560">Upload</div>
+                            <div class="thr-val" id="apTX">0</div>
+                            <div class="thr-bar-wrap"><div class="thr-bar thr-tx" id="apTXbar" style="width:0%"></div></div>
+                        </div>
+                    </div>
+                </div>
+                <div style="background:rgba(255,170,0,0.04);border-radius:12px;padding:16px;border:1px solid rgba(255,170,0,0.1)">
+                    <div class="thr-title" style="color:#ffaa00">USB (LAN)</div>
+                    <div style="display:flex;justify-content:space-around;gap:8px">
+                        <div style="text-align:center;flex:1">
+                            <div class="thr-dir" style="color:#00ff88">Download</div>
+                            <div class="thr-val" id="usbRX">0</div>
+                            <div class="thr-bar-wrap"><div class="thr-bar thr-rx" id="usbRXbar" style="width:0%"></div></div>
+                        </div>
+                        <div style="text-align:center;flex:1">
+                            <div class="thr-dir" style="color:#e94560">Upload</div>
+                            <div class="thr-val" id="usbTX">0</div>
+                            <div class="thr-bar-wrap"><div class="thr-bar thr-tx" id="usbTXbar" style="width:0%"></div></div>
+                        </div>
+                    </div>
+                </div>
             </div>
         </div>
 
         <div class="card">
-            <h2>⚙ 工作模式</h2>
-            <div class="mode-toggle">
-                <button class="mode-btn active" id="btnStaMode" onclick="switchMode('sta')">STA 模式 (客户端)</button>
-                <button class="mode-btn" id="btnApMode" onclick="switchMode('ap')">AP 模式 (热点)</button>
-            </div>
-            <p style="color:#8892b0;font-size:13px;margin-top:8px" id="modeDesc">STA 模式：连接到已有 WiFi 网络，通过 USB 共享上网</p>
-        </div>
-
-        <div class="card section-sta show" id="sectionSta">
-            <h2>⚙ STA 配置 (连接 WiFi)</h2>
+            <h2><span class="dot dot-offline" id="staFormDot"></span> STA — Connect to WiFi</h2>
             <form id="wifiForm" onsubmit="return false;">
-                <div class="form-group"><label for="ssid">WiFi SSID (网络名称)</label><input type="text" id="ssid" name="ssid" placeholder="输入 WiFi 名称" required></div>
-                <div class="form-group"><label for="password">WiFi 密码</label><input type="password" id="password" name="password" placeholder="输入 WiFi 密码 (至少8位)" minlength="8" required></div>
-                <button type="submit" class="btn btn-primary" id="connectBtn" onclick="connectWiFi()">连接 WiFi</button>
+                <div class="form-group"><label for="ssid">WiFi SSID</label><input type="text" id="ssid" name="ssid" placeholder="WiFi name" required></div>
+                <div class="form-group"><label for="password">WiFi Password</label><input type="password" id="password" name="password" placeholder="Password (min 8 chars)" minlength="8" required></div>
+                <button type="submit" class="btn btn-primary" id="connectBtn" onclick="connectWiFi()">Connect</button>
             </form>
         </div>
 
-        <div class="card section-ap" id="sectionAp">
-            <h2>⚙ AP 配置 (热点设置)</h2>
+        <div class="card">
+            <h2><span class="dot dot-offline" id="apFormDot"></span> AP — Hotspot Settings</h2>
             <form id="apForm" onsubmit="return false;">
-                <div class="form-group"><label for="apSsid">AP SSID (热点名称)</label><input type="text" id="apSsid" name="apSsid" required></div>
-                <div class="form-group"><label for="apPassword">AP 密码</label><input type="text" id="apPassword" name="apPassword" minlength="8" required></div>
-                <button type="submit" class="btn btn-primary" id="apBtn" onclick="startAP()">启动热点</button>
-                <button type="button" class="btn btn-outline" id="stopApBtn" onclick="stopAP()" style="display:none">停止热点</button>
+                <div class="form-group"><label for="apSsid">AP SSID</label><input type="text" id="apSsid" name="apSsid" required></div>
+                <div class="form-group"><label for="apPassword">AP Password</label><input type="text" id="apPassword" name="apPassword" minlength="8" required></div>
+                <button type="submit" class="btn btn-ap-start" id="apBtn" onclick="toggleAP()">Start Hotspot</button>
+                <button type="button" class="btn btn-outline" id="stopApBtn" onclick="stopAP()" style="display:none">Stop Hotspot</button>
             </form>
         </div>
 
         <div class="card">
-            <h2>🔌 USB 网络</h2>
-            <p style="color:#8892b0;margin-bottom:8px">通过 USB 线连接电脑，电脑会自动识别为以太网设备并获得 IP</p>
-            <div class="ip-box">ESP32 USB 管理地址: <strong style="color:#e94560">http://192.168.5.1</strong></div>
+            <h2>USB Network</h2>
+            <p style="color:#8892b0;margin-bottom:8px">Plug USB to computer for automatic Ethernet device recognition</p>
+            <div class="ip-box">ESP32 USB Management: <strong style="color:#e94560">http://192.168.5.1</strong></div>
         </div>
 
         <div class="card">
-            <h2>🔧 系统</h2>
-            <button class="btn btn-danger" onclick="restartDevice()">重启设备</button>
-            <p style="color:#8892b0;margin-top:8px;font-size:12px">运行时间: <span id="uptime">0s</span></p>
+            <h2>System</h2>
+            <button class="btn btn-danger" onclick="restartDevice()">Restart Device</button>
+            <p style="color:#8892b0;margin-top:8px;font-size:12px">Uptime: <span id="uptime">0s</span></p>
         </div>
     </div>
     <div class="toast" id="toast"></div>
     <script>
-        var curMode='sta';
         var startTime=Math.floor(Date.now()/1000);
-        function showToast(msg,type){var t=document.getElementById('toast');t.textContent=msg;t.className='toast toast-'+type;t.style.display='block';setTimeout(function(){t.style.display='none'},4000)}
-        function setActiveMode(m){
-            curMode=m;
-            var btnSta=document.getElementById('btnStaMode');
-            var btnAp=document.getElementById('btnApMode');
-            var secSta=document.getElementById('sectionSta');
-            var secAp=document.getElementById('sectionAp');
-            var desc=document.getElementById('modeDesc');
-            var bad=document.getElementById('modeBadge');
-            var cliBox=document.getElementById('apClientsBox');
+        var maxBps=1;
+
+        function showToast(msg,type){
+            var t=document.getElementById('toast');
+            t.textContent=msg;
+            t.className='toast toast-'+type;
+            t.style.display='block';
+            setTimeout(function(){t.style.display='none'},4000);
+        }
+
+        function fmtBps(bps){
+            if(!bps||bps===0)return'0';
+            if(bps>=1048576)return(bps/1048576).toFixed(1)+' M/s';
+            if(bps>=1024)return(bps/1024).toFixed(0)+' K/s';
+            return bps+' B/s';
+        }
+
+        function updThr(id,bps,barId){
+            var el=document.getElementById(id);
+            var old=parseFloat(el.textContent)||0;
+            el.textContent=fmtBps(bps);
+            if(bps>maxBps)maxBps=bps;
+            var pct=Math.min(100,(bps/Math.max(maxBps,1))*100);
+            document.getElementById(barId).style.width=pct+'%';
+            if(bps>100000)el.style.color='#ff6b6b';
+            else if(bps>10000)el.style.color='#ffaa00';
+            else el.style.color='#8892b0';
+        }
+
+        function updateUI(d){
+            var staState=d.sta_state||'disconnected';
+            document.getElementById('staState').textContent=
+                staState==='connected'?'Connected':
+                staState==='connecting'?'Connecting...':'Disconnected';
+
+            var staDot=document.getElementById('staDot');
+            staDot.className='dot '+(staState==='connected'?'dot-online':
+                staState==='connecting'?'dot-connecting':'dot-offline');
+
+            document.getElementById('staSSID').textContent=d.sta_ssid||'--';
+            document.getElementById('staIP').textContent=d.sta_ip||'--';
+
+            if(d.sta_rssi){
+                document.getElementById('staRSSI').textContent=d.sta_rssi+' dBm';
+                var pct=Math.min(100,Math.max(0,(d.sta_rssi+100)*2));
+                var bar=document.getElementById('rssiBar');
+                bar.style.width=pct+'%';
+                bar.className='rssi-fill '+(pct>60?'rssi-good':pct>30?'rssi-ok':'rssi-bad');
+            }else{
+                document.getElementById('staRSSI').textContent='--';
+                document.getElementById('rssiBar').style.width='0%';
+            }
+
+            var apActive=d.ap_active===true;
+            document.getElementById('apState').textContent=apActive?'Active':'Inactive';
+            var apDot=document.getElementById('apDot');
+            apDot.className='dot '+(apActive?'dot-active':'dot-offline');
+            document.getElementById('apSSID').textContent=d.ap_ssid||'--';
+            document.getElementById('apClients').textContent=d.ap_clients||'0';
+
+            var apFormDot=document.getElementById('apFormDot');
+            apFormDot.className='dot '+(apActive?'dot-active':'dot-offline');
+
             var stopBtn=document.getElementById('stopApBtn');
             var apBtn=document.getElementById('apBtn');
-            if(m==='ap'){
-                btnSta.className='mode-btn';
-                btnAp.className='mode-btn active';
-                secSta.className='card section-sta';
-                secAp.className='card section-ap show';
-                desc.textContent='AP 模式：ESP32 作为 WiFi 热点，其他设备可连接到此热点';
-                bad.className='badge badge-ap';bad.textContent='AP';
-                cliBox.style.display='block';
+            if(apActive){
                 stopBtn.style.display='block';
-                apBtn.textContent='更新热点配置';
+                apBtn.textContent='Update Hotspot';
+                apBtn.className='btn btn-primary';
             }else{
-                btnSta.className='mode-btn active';
-                btnAp.className='mode-btn';
-                secSta.className='card section-sta show';
-                secAp.className='card section-ap';
-                desc.textContent='STA 模式：连接到已有 WiFi 网络，通过 USB 共享上网';
-                bad.className='badge badge-sta';bad.textContent='STA';
-                cliBox.style.display='none';
                 stopBtn.style.display='none';
-                apBtn.textContent='启动热点';
+                apBtn.textContent='Start Hotspot';
+                apBtn.className='btn btn-ap-start';
             }
+
+            var mode=d.mode||'sta';
+            var badge=document.getElementById('modeBadge');
+            if(mode==='apsta'){badge.className='badge badge-apsta';badge.textContent='AP+STA';}
+            else if(mode==='ap'){badge.className='badge badge-ap';badge.textContent='AP';}
+            else{badge.className='badge badge-sta';badge.textContent='STA';}
+
+            updThr('staRX',d.sta_down_bps||0,'staRXbar');
+            updThr('staTX',d.sta_up_bps||0,'staTXbar');
+            updThr('apRX',d.ap_down_bps||0,'apRXbar');
+            updThr('apTX',d.ap_up_bps||0,'apTXbar');
+            updThr('usbRX',d.usb_down_bps||0,'usbRXbar');
+            updThr('usbTX',d.usb_up_bps||0,'usbTXbar');
+
+            if(d.sta_ssid)document.getElementById('ssid').value=d.sta_ssid;
+            if(d.sta_password)document.getElementById('password').value=d.sta_password;
+            if(d.ap_ssid)document.getElementById('apSsid').value=d.ap_ssid;
+            if(d.ap_password)document.getElementById('apPassword').value=d.ap_password;
         }
-        function switchMode(m){
-            if(m===curMode)return;
-            fetch('/api/wifi/mode',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'mode='+m}).then(function(r){return r.json()}).then(function(d){
-                if(d.success){setActiveMode(m);showToast('已切换到 '+m.toUpperCase()+' 模式','success');updateStatus()}else{showToast('切换失败','error')}
-            });
-        }
+
         function updateStatus(){
-            fetch('/api/wifi/status').then(function(r){return r.json()}).then(function(d){
-                document.getElementById('wifiState').textContent=d.state==='connected'?'已连接':d.state==='connecting'?'连接中...':'未连接';
-                document.getElementById('wifiSSID').textContent=(d.mode==='ap'?d.ap_ssid:d.ssid)||'--';
-                document.getElementById('wifiIP').textContent=d.ip||'--';
-                if(d.rssi){
-                    document.getElementById('wifiRSSI').textContent=d.rssi+' dBm';
-                    var pct=Math.min(100,Math.max(0,(d.rssi+100)*2));
-                    var bar=document.getElementById('rssiBar');
-                    bar.style.width=pct+'%';
-                    bar.className='rssi-fill '+(pct>60?'rssi-good':pct>30?'rssi-ok':'rssi-bad');
-                }else{
-                    document.getElementById('wifiRSSI').textContent='--';
-                    document.getElementById('rssiBar').style.width='0%';
-                }
-                var dot=document.getElementById('statusDot');
-                dot.className='dot '+(d.state==='connected'?'dot-online':d.state==='connecting'?'dot-connecting':'dot-offline');
-                if(d.ssid)document.getElementById('ssid').value=d.ssid;
-                if(d.password)document.getElementById('password').value=d.password;
-                if(d.ap_ssid)document.getElementById('apSsid').value=d.ap_ssid;
-                if(d.ap_password)document.getElementById('apPassword').value=d.ap_password;
-                document.getElementById('apClients').textContent=d.ap_clients||'0';
-                if(d.mode!==curMode)setActiveMode(d.mode);
-            });
+            fetch('/api/wifi/status').then(function(r){return r.json()}).then(updateUI);
         }
+
         function connectWiFi(){
             var ssid=document.getElementById('ssid').value.trim();
             var pass=document.getElementById('password').value.trim();
-            if(!ssid||!pass){showToast('请填写 SSID 和密码','error');return}
-            if(pass.length<8){showToast('密码至少8位','error');return}
+            if(!ssid||!pass){showToast('Please enter SSID and password','error');return}
+            if(pass.length<8){showToast('Password must be at least 8 characters','error');return}
             var btn=document.getElementById('connectBtn');
-            btn.disabled=true;btn.textContent='连接中...';
+            btn.disabled=true;btn.textContent='Connecting...';
             var body='ssid='+encodeURIComponent(ssid)+'&password='+encodeURIComponent(pass);
             fetch('/api/wifi/connect',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:body}).then(function(r){return r.json()}).then(function(d){
-                if(d.success){showToast('配置已保存，正在连接...','success');setTimeout(updateStatus,3000);setTimeout(updateStatus,8000)}
-                else{showToast('连接失败: '+(d.message||'未知错误'),'error')}
-                btn.disabled=false;btn.textContent='连接 WiFi';
-            }).catch(function(e){showToast('请求失败','error');btn.disabled=false;btn.textContent='连接 WiFi'});
+                if(d.success){showToast('Config saved, connecting...','success');setTimeout(updateStatus,3000);setTimeout(updateStatus,8000)}
+                else{showToast('Connect failed: '+(d.message||'unknown'),'error')}
+                btn.disabled=false;btn.textContent='Connect';
+            }).catch(function(e){showToast('Request failed','error');btn.disabled=false;btn.textContent='Connect'});
         }
-        function startAP(){
+
+        function toggleAP(){
             var ssid=document.getElementById('apSsid').value.trim();
             var pass=document.getElementById('apPassword').value.trim();
-            if(!ssid||!pass){showToast('请填写 AP SSID 和密码','error');return}
-            if(pass.length<8){showToast('密码至少8位','error');return}
+            if(!ssid||!pass){showToast('Please enter AP SSID and password','error');return}
+            if(pass.length<8){showToast('Password must be at least 8 characters','error');return}
             var btn=document.getElementById('apBtn');
-            btn.disabled=true;btn.textContent='启动中...';
+            btn.disabled=true;btn.textContent='Starting...';
             var body='ssid='+encodeURIComponent(ssid)+'&password='+encodeURIComponent(pass);
             fetch('/api/wifi/ap/start',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:body}).then(function(r){return r.json()}).then(function(d){
-                if(d.success){showToast('AP 热点已启动','success');updateStatus()}
-                else{showToast('启动失败','error')}
-                btn.disabled=false;btn.textContent='更新热点配置';
-            }).catch(function(e){showToast('请求失败','error');btn.disabled=false;btn.textContent='更新热点配置'});
+                if(d.success){showToast('Hotspot started','success');updateStatus()}
+                else{showToast('Start failed','error')}
+                btn.disabled=false;
+            }).catch(function(e){showToast('Request failed','error');btn.disabled=false});
         }
+
         function stopAP(){
             fetch('/api/wifi/ap/stop',{method:'POST'}).then(function(r){return r.json()}).then(function(d){
-                if(d.success){showToast('AP 已停止','success');updateStatus()}
+                if(d.success){showToast('Hotspot stopped','success');updateStatus()}
             });
         }
-        function restartDevice(){if(!confirm('确定要重启设备吗？'))return;fetch('/api/restart',{method:'POST'}).then(function(){showToast('设备重启中...','success')})}
-        function updateUptime(){var s=Math.floor(Date.now()/1000)-startTime;var d=Math.floor(s/86400),h=Math.floor(s%86400/3600),m=Math.floor(s%3600/60),sec=s%60;var str=d>0?d+'d '+h+'h':h>0?h+'h '+m+'m':m>0?m+'m '+sec+'s':sec+'s';document.getElementById('uptime').textContent=str}
-        updateStatus();setInterval(updateStatus,5000);setInterval(updateUptime,1000)
+
+        function restartDevice(){
+            if(!confirm('Restart device?'))return;
+            fetch('/api/restart',{method:'POST'}).then(function(){showToast('Restarting...','success')});
+        }
+
+        function updateUptime(){
+            var s=Math.floor(Date.now()/1000)-startTime;
+            var d=Math.floor(s/86400),h=Math.floor(s%86400/3600),m=Math.floor(s%3600/60),sec=s%60;
+            var str=d>0?d+'d '+h+'h':h>0?h+'h '+m+'m':m>0?m+'m '+sec+'s':sec+'s';
+            document.getElementById('uptime').textContent=str;
+        }
+
+        updateStatus();
+        setInterval(updateStatus,2000);
+        setInterval(updateUptime,1000);
     </script>
 </body>
 </html>
@@ -259,40 +371,59 @@ static esp_err_t root_get_handler(httpd_req_t* req)
 
 static esp_err_t api_wifi_status_handler(httpd_req_t* req)
 {
-    char buffer[768];
+    char buffer[1024];
     wifi_service_get_status_json(buffer, sizeof(buffer));
     httpd_resp_set_type(req, "application/json");
     httpd_resp_send(req, buffer, strlen(buffer));
     return ESP_OK;
 }
 
+static bool parse_urlencoded(const char* buf, int len,
+                              char* ssid_out, size_t ssid_size,
+                              char* pass_out, size_t pass_size)
+{
+    bool found = false;
+
+    const char* ssid_start = strstr(buf, "ssid=");
+    if (ssid_start) {
+        ssid_start += 5;
+        const char* end = strchr(ssid_start, '&');
+        if (end) {
+            size_t copy_len = (size_t)(end - ssid_start);
+            if (copy_len >= ssid_size) copy_len = ssid_size - 1;
+            memcpy(ssid_out, ssid_start, copy_len);
+            ssid_out[copy_len] = '\0';
+        } else {
+            strncpy(ssid_out, ssid_start, ssid_size - 1);
+        }
+        found = true;
+    }
+
+    const char* pass_start = strstr(buf, "password=");
+    if (pass_start) {
+        pass_start += 9;
+        strncpy(pass_out, pass_start, pass_size - 1);
+    }
+
+    return found;
+}
+
 static esp_err_t api_wifi_connect_handler(httpd_req_t* req)
 {
-    char ssid[64] = {0};
+    char ssid[64]     = {0};
     char password[64] = {0};
 
     char buf[256];
     int ret = httpd_req_recv(req, buf, sizeof(buf) - 1);
     if (ret > 0 && ret < (int)sizeof(buf)) {
         buf[ret] = '\0';
-        char* ssid_start = strstr(buf, "ssid=");
-        if (ssid_start) {
-            ssid_start += 5;
-            char* end = strchr(ssid_start, '&');
-            if (end) { size_t len = end - ssid_start; if (len < sizeof(ssid)) { memcpy(ssid, ssid_start, len); ssid[len] = '\0'; } }
-            else { strncpy(ssid, ssid_start, sizeof(ssid) - 1); }
-        }
-        char* pass_start = strstr(buf, "password=");
-        if (pass_start) { pass_start += 9; strncpy(password, pass_start, sizeof(password) - 1); }
-        for (int i = (int)strlen(ssid) - 1; i >= 0 && ssid[i] == ' '; i--) ssid[i] = '\0';
-        for (int i = (int)strlen(password) - 1; i >= 0 && password[i] == ' '; i--) password[i] = '\0';
-        char* amp = strchr(ssid, '&'); if (amp) *amp = '\0';
-        amp = strchr(password, '&'); if (amp) *amp = '\0';
+        parse_urlencoded(buf, ret, ssid, sizeof(ssid), password, sizeof(password));
     }
 
     if (strlen(ssid) == 0 || strlen(password) == 0) {
         httpd_resp_set_type(req, "application/json");
-        httpd_resp_send(req, "{\"success\":false,\"message\":\"SSID or password empty\"}", HTTPD_RESP_USE_STRLEN);
+        httpd_resp_send(req, "{\"success\":false,\"message\":\"SSID or password empty\"}",
+                        HTTPD_RESP_USE_STRLEN);
         return ESP_OK;
     }
 
@@ -301,7 +432,8 @@ static esp_err_t api_wifi_connect_handler(httpd_req_t* req)
     ESP_LOGI(TAG, "WiFi connect queued: SSID=%s", ssid);
 
     httpd_resp_set_type(req, "application/json");
-    httpd_resp_send(req, "{\"success\":true,\"message\":\"Connecting...\"}", HTTPD_RESP_USE_STRLEN);
+    httpd_resp_send(req, "{\"success\":true,\"message\":\"Connecting...\"}",
+                    HTTPD_RESP_USE_STRLEN);
     return ESP_OK;
 }
 
@@ -314,10 +446,12 @@ static esp_err_t api_wifi_mode_handler(httpd_req_t* req)
         char* mode_start = strstr(buf, "mode=");
         if (mode_start) {
             mode_start += 5;
-            if (strncmp(mode_start, "ap", 2) == 0) {
-                wifi_service_post_start_ap(NULL, NULL);
+            if (strncmp(mode_start, "apsta", 5) == 0) {
+                wifi_service_post_set_mode(WIFI_OP_MODE_APSTA);
+            } else if (strncmp(mode_start, "ap", 2) == 0) {
+                wifi_service_post_set_mode(WIFI_OP_MODE_AP);
             } else {
-                wifi_service_post_stop_ap();
+                wifi_service_post_set_mode(WIFI_OP_MODE_STA);
             }
         }
     }
@@ -329,22 +463,14 @@ static esp_err_t api_wifi_mode_handler(httpd_req_t* req)
 
 static esp_err_t api_ap_start_handler(httpd_req_t* req)
 {
-    char ssid[64] = {0};
+    char ssid[64]     = {0};
     char password[64] = {0};
 
     char buf[256];
     int ret = httpd_req_recv(req, buf, sizeof(buf) - 1);
     if (ret > 0 && ret < (int)sizeof(buf)) {
         buf[ret] = '\0';
-        char* ssid_start = strstr(buf, "ssid=");
-        if (ssid_start) {
-            ssid_start += 5;
-            char* end = strchr(ssid_start, '&');
-            if (end) { size_t len = end - ssid_start; if (len < sizeof(ssid)) { memcpy(ssid, ssid_start, len); ssid[len] = '\0'; } }
-            else { strncpy(ssid, ssid_start, sizeof(ssid) - 1); }
-        }
-        char* pass_start = strstr(buf, "password=");
-        if (pass_start) { pass_start += 9; strncpy(password, pass_start, sizeof(password) - 1); }
+        parse_urlencoded(buf, ret, ssid, sizeof(ssid), password, sizeof(password));
     }
 
     if (strlen(ssid) > 0 && strlen(password) > 0) {
@@ -382,15 +508,15 @@ void web_server_start(WebServer* ws)
 {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.server_port = 80;
-    config.stack_size = 8192;
+    config.stack_size  = 8192;
 
-    httpd_uri_t root_uri       = { .uri = "/", .method = HTTP_GET, .handler = root_get_handler, .user_ctx = NULL };
-    httpd_uri_t status_uri     = { .uri = "/api/wifi/status", .method = HTTP_GET, .handler = api_wifi_status_handler, .user_ctx = NULL };
-    httpd_uri_t connect_uri    = { .uri = "/api/wifi/connect", .method = HTTP_POST, .handler = api_wifi_connect_handler, .user_ctx = NULL };
-    httpd_uri_t mode_uri       = { .uri = "/api/wifi/mode", .method = HTTP_POST, .handler = api_wifi_mode_handler, .user_ctx = NULL };
-    httpd_uri_t ap_start_uri   = { .uri = "/api/wifi/ap/start", .method = HTTP_POST, .handler = api_ap_start_handler, .user_ctx = NULL };
-    httpd_uri_t ap_stop_uri    = { .uri = "/api/wifi/ap/stop", .method = HTTP_POST, .handler = api_ap_stop_handler, .user_ctx = NULL };
-    httpd_uri_t restart_uri    = { .uri = "/api/restart", .method = HTTP_POST, .handler = api_restart_handler, .user_ctx = NULL };
+    httpd_uri_t root_uri     = { .uri = "/", .method = HTTP_GET, .handler = root_get_handler, .user_ctx = NULL };
+    httpd_uri_t status_uri   = { .uri = "/api/wifi/status", .method = HTTP_GET, .handler = api_wifi_status_handler, .user_ctx = NULL };
+    httpd_uri_t connect_uri  = { .uri = "/api/wifi/connect", .method = HTTP_POST, .handler = api_wifi_connect_handler, .user_ctx = NULL };
+    httpd_uri_t mode_uri     = { .uri = "/api/wifi/mode", .method = HTTP_POST, .handler = api_wifi_mode_handler, .user_ctx = NULL };
+    httpd_uri_t ap_start_uri = { .uri = "/api/wifi/ap/start", .method = HTTP_POST, .handler = api_ap_start_handler, .user_ctx = NULL };
+    httpd_uri_t ap_stop_uri  = { .uri = "/api/wifi/ap/stop", .method = HTTP_POST, .handler = api_ap_stop_handler, .user_ctx = NULL };
+    httpd_uri_t restart_uri  = { .uri = "/api/restart", .method = HTTP_POST, .handler = api_restart_handler, .user_ctx = NULL };
 
     if (httpd_start(&ws->server, &config) == ESP_OK) {
         httpd_register_uri_handler(ws->server, &root_uri);

@@ -24,6 +24,8 @@ static esp_netif_ip_info_t s_usb_ip_info;
 static esp_timer_handle_t s_dhcp_restart_timer = NULL;
 static int s_tx_fail_count = 0;
 static bool s_link_down = false;
+static uint64_t s_usb_rx_total = 0;
+static uint64_t s_usb_tx_total = 0;
 
 static void check_heap(void)
 {
@@ -38,33 +40,37 @@ static void tx_buffer_free(void* buffer, void* ctx)
 
 static esp_err_t netif_transmit(void* h, void* buffer, size_t len)
 {
+    if (!tud_ready() || s_link_down) {
+        return ESP_OK;
+    }
+
     esp_err_t ret = tinyusb_net_send_sync(buffer, (uint16_t)len, NULL, pdMS_TO_TICKS(500));
     if (ret != ESP_OK) {
         s_tx_fail_count++;
-        if (s_tx_fail_count <= 5 || (s_tx_fail_count % 100) == 0) {
+        if (s_tx_fail_count <= 5 || (s_tx_fail_count % 50) == 0) {
             ESP_LOGW(TAG, "TX failed: %d, len=%u (fail_cnt=%d, link_down=%d)",
                      ret, (unsigned)len, s_tx_fail_count, s_link_down);
-            check_heap();
         }
-
-        if (!s_link_down && s_tx_fail_count > 50) {
+        if (!s_link_down && s_tx_fail_count > 30) {
             s_link_down = true;
             ESP_LOGW(TAG, "Link down after %d consecutive TX failures", s_tx_fail_count);
             tud_network_link_state(0, false);
         }
-    } else {
-        if (s_link_down) {
-            ESP_LOGI(TAG, "Link recovered after %d TX failures, restarting DHCP...", s_tx_fail_count);
-            s_link_down = false;
-            tud_network_link_state(0, true);
-            if (s_dhcp_restart_timer) {
-                esp_timer_stop(s_dhcp_restart_timer);
-                esp_timer_start_once(s_dhcp_restart_timer, 500000);
-            }
-        }
-        s_tx_fail_count = 0;
+        return ESP_OK;
     }
-    return ret;
+
+    if (s_link_down) {
+        ESP_LOGI(TAG, "Link recovered after %d TX failures, restarting DHCP...", s_tx_fail_count);
+        s_link_down = false;
+        tud_network_link_state(0, true);
+        if (s_dhcp_restart_timer) {
+            esp_timer_stop(s_dhcp_restart_timer);
+            esp_timer_start_once(s_dhcp_restart_timer, 500000);
+        }
+    }
+    s_tx_fail_count = 0;
+    s_usb_tx_total += len;
+    return ESP_OK;
 }
 
 static esp_err_t netif_recv_callback(void* buffer, uint16_t len, void* ctx)
@@ -83,9 +89,9 @@ static esp_err_t netif_recv_callback(void* buffer, uint16_t len, void* ctx)
 
     esp_err_t ret = esp_netif_receive(s_usb_netif, buf_copy, len, NULL);
     if (ret != ESP_OK) {
-        free(buf_copy);
         ESP_LOGW(TAG, "RX esp_netif_receive err: %d, len=%u", ret, len);
-        check_heap();
+    } else {
+        s_usb_rx_total += len;
     }
     return ret;
 }
@@ -103,16 +109,15 @@ static void apply_dhcp_options(void)
     esp_netif_dhcps_option(s_usb_netif, ESP_NETIF_OP_SET, ESP_NETIF_IP_ADDRESS_LEASE_TIME,
                            &lease_seconds, sizeof(lease_seconds));
 
+    uint8_t dns_enable = 0x02;
+    esp_netif_dhcps_option(s_usb_netif, ESP_NETIF_OP_SET, ESP_NETIF_DOMAIN_NAME_SERVER,
+                           &dns_enable, sizeof(dns_enable));
+
     esp_netif_dns_info_t dns;
     memset(&dns, 0, sizeof(dns));
     dns.ip.type = ESP_IPADDR_TYPE_V4;
     IP4_ADDR(&dns.ip.u_addr.ip4, 8, 8, 8, 8);
-    esp_netif_dhcps_option(s_usb_netif, ESP_NETIF_OP_SET, ESP_NETIF_DOMAIN_NAME_SERVER,
-                           &dns, sizeof(dns));
-
-    uint8_t router_enable = 1;
-    esp_netif_dhcps_option(s_usb_netif, ESP_NETIF_OP_SET, ESP_NETIF_ROUTER_SOLICITATION_ADDRESS,
-                           &router_enable, sizeof(router_enable));
+    esp_netif_set_dns_info(s_usb_netif, ESP_NETIF_DNS_MAIN, &dns);
 }
 
 static void dhcp_restart_timer_cb(void* arg)
@@ -300,4 +305,14 @@ void usb_network_reconnect(void)
     if (!s_usb_netif) return;
     esp_netif_dhcps_start(s_usb_netif);
     ESP_LOGI(TAG, "USB reconnect done");
+}
+
+uint64_t usb_network_get_rx_total(void)
+{
+    return s_usb_rx_total;
+}
+
+uint64_t usb_network_get_tx_total(void)
+{
+    return s_usb_tx_total;
 }
