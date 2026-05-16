@@ -104,5 +104,6 @@ esp_netif_set_dns_info(netif, ESP_NETIF_DNS_MAIN, &dns);
 
 `ip_napt_enable_netif()` 必须通过 `tcpip_callback()` 在 lwIP TCP/IP 线程中调用，直接从事件处理线程调用会导致 NAT 表损坏。
 <div align="center">
-    <img src="https://github.com/user-attachments/assets/2c662b61-ee73-4452-9cf6-a26b57196296" width="780" />
+   <img width="1003" height="1831" alt="192 168 5 1_" src="https://github.com/user-attachments/assets/ff37252e-347e-4b3d-bf65-308be6c9870e" />
 </div>
+
