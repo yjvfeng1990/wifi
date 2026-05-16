@@ -9,6 +9,10 @@
 extern "C" {
 #endif
 
+#define DHCP_CLIENT_MAX 16
+
+#define WIFI_SCAN_MAX_RESULTS 32
+
 typedef enum {
     WIFI_OP_MODE_STA   = 0,
     WIFI_OP_MODE_AP    = 1,
@@ -20,6 +24,24 @@ typedef enum {
     WIFI_STATE_CONNECTING,
     WIFI_STATE_CONNECTED
 } wifi_state_t;
+
+typedef enum {
+    DHCP_CLIENT_SRC_AP  = 0,
+    DHCP_CLIENT_SRC_USB = 1
+} dhcp_client_source_t;
+
+typedef struct {
+    dhcp_client_source_t source;
+    uint8_t mac[6];
+    char    ip[16];
+} dhcp_client_info_t;
+
+typedef struct {
+    char ssid[33];
+    int  rssi;
+    int  channel;
+    int  authmode;
+} wifi_scan_item_t;
 
 typedef struct {
     wifi_op_mode_t mode;
@@ -47,6 +69,12 @@ void wifi_service_save_config(const char* ssid, const char* password);
 bool wifi_service_has_config(void);
 void wifi_service_get_status(WiFiStatus* status);
 void wifi_service_get_status_json(char* buffer, size_t buffer_size);
+int  wifi_service_get_dhcp_clients(dhcp_client_info_t* clients, int max_count);
+void wifi_service_get_dhcp_clients_json(char* buffer, size_t buffer_size);
+
+int  wifi_service_scan(wifi_scan_item_t* items, int max_count);
+void wifi_service_scan_start(void);
+void wifi_service_get_scan_json(char* buffer, size_t buffer_size);
 
 void wifi_service_set_mode(wifi_op_mode_t mode);
 wifi_op_mode_t wifi_service_get_mode(void);

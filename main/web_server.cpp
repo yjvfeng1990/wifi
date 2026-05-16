@@ -3,6 +3,7 @@
 #include "esp_log.h"
 #include "esp_system.h"
 #include "esp_timer.h"
+#include "esp_wifi.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "web_server.h"
@@ -14,13 +15,16 @@ extern "C" {
 
 static esp_err_t root_get_handler(httpd_req_t* req)
 {
+    httpd_resp_set_hdr(req, "Cache-Control", "no-cache, no-store, must-revalidate");
+    httpd_resp_set_type(req, "text/html");
     const char* html = R"rawliteral(
 <!DOCTYPE html>
 <html lang="zh-CN">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>ESP32-S3 WiFi Manager</title>
+    <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
+    <title>ESP32-S3 WiFi Router v4</title>
     <style>
         *{margin:0;padding:0;box-sizing:border-box}
         body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:linear-gradient(135deg,#1a1a2e 0%,#16213e 50%,#0f3460 100%);min-height:100vh;padding:20px;color:#e0e0e0}
@@ -80,6 +84,28 @@ static esp_err_t root_get_handler(httpd_req_t* req)
         .thr-tx{background:linear-gradient(90deg,#e94560,#ff6b6b)}
         .thr-sep{width:1px;background:rgba(255,255,255,0.1);margin:0 8px}
         .thr-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:16px}
+        .dhcp-table{width:100%;border-collapse:collapse;font-size:13px}
+        .dhcp-table th{text-align:left;padding:10px 12px;color:#8892b0;font-weight:500;font-size:11px;text-transform:uppercase;letter-spacing:1px;border-bottom:1px solid rgba(255,255,255,0.08)}
+        .dhcp-table td{padding:10px 12px;border-bottom:1px solid rgba(255,255,255,0.03);font-family:monospace}
+        .dhcp-table tr:hover{background:rgba(255,255,255,0.02)}
+        .dhcp-empty{text-align:center;color:#555;padding:20px;font-size:13px}
+        .dhcp-badge{display:inline-block;padding:2px 8px;border-radius:10px;font-size:10px;font-weight:600}
+        .dhcp-badge-ap{background:rgba(0,200,255,0.15);color:#00c8ff}
+        .dhcp-badge-usb{background:rgba(255,170,0,0.15);color:#ffaa00}
+        .scan-btn{background:rgba(0,200,255,0.15);color:#00c8ff;border:1px solid rgba(0,200,255,0.3);padding:10px 18px;border-radius:8px;font-size:13px;font-weight:600;cursor:pointer;transition:all 0.3s;margin-bottom:12px;display:inline-flex;align-items:center;gap:6px}
+        .scan-btn:hover{background:rgba(0,200,255,0.25)}
+        .scan-btn:disabled{opacity:0.4;cursor:not-allowed}
+        .scan-spinner{display:inline-block;width:14px;height:14px;border:2px solid rgba(0,200,255,0.2);border-top:2px solid #00c8ff;border-radius:50%;animation:spin 0.8s linear infinite}
+        @keyframes spin{from{transform:rotate(0deg)}to{transform:rotate(360deg)}}
+        .scan-list{max-height:260px;overflow-y:auto;margin-top:8px}
+        .scan-item{display:flex;align-items:center;padding:10px 14px;border-radius:8px;cursor:pointer;transition:background 0.2s;border:1px solid transparent}
+        .scan-item:hover{background:rgba(0,200,255,0.08);border-color:rgba(0,200,255,0.15)}
+        .scan-item-icon{width:32px;height:32px;border-radius:50%;display:flex;align-items:center;justify-content:center;margin-right:12px;font-size:14px;flex-shrink:0}
+        .scan-item-icon-secure{background:rgba(0,255,136,0.15);color:#00ff88}
+        .scan-item-icon-open{background:rgba(255,170,0,0.15);color:#ffaa00}
+        .scan-item-info{flex:1;min-width:0}
+        .scan-item-ssid{font-weight:500;font-size:14px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+        .scan-item-meta{font-size:11px;color:#8892b0;margin-top:2px}
         @media(max-width:600px){.header h1{font-size:1.6em}.status-grid{grid-template-columns:1fr 1fr}.thr-grid{grid-template-columns:1fr}}
     </style>
 </head>
@@ -178,6 +204,14 @@ static esp_err_t root_get_handler(httpd_req_t* req)
 
         <div class="card">
             <h2><span class="dot dot-offline" id="staFormDot"></span> STA — Connect to WiFi</h2>
+            <button class="scan-btn" id="scanBtn" onclick="startScan()">Scan Networks</button>
+            <div id="scanContainer" style="display:none">
+                <div style="display:flex;align-items:center;gap:8px;margin-bottom:10px">
+                    <span class="scan-spinner" id="scanSpinner"></span>
+                    <span style="font-size:13px;color:#8892b0" id="scanStatus">Scanning...</span>
+                </div>
+                <div class="scan-list" id="scanList"></div>
+            </div>
             <form id="wifiForm" onsubmit="return false;">
                 <div class="form-group"><label for="ssid">WiFi SSID</label><input type="text" id="ssid" name="ssid" placeholder="WiFi name" required></div>
                 <div class="form-group"><label for="password">WiFi Password</label><input type="password" id="password" name="password" placeholder="Password (min 8 chars)" minlength="8" required></div>
@@ -199,6 +233,13 @@ static esp_err_t root_get_handler(httpd_req_t* req)
             <h2>USB Network</h2>
             <p style="color:#8892b0;margin-bottom:8px">Plug USB to computer for automatic Ethernet device recognition</p>
             <div class="ip-box">ESP32 USB Management: <strong style="color:#e94560">http://192.168.5.1</strong></div>
+        </div>
+
+        <div class="card">
+            <h2>DHCP Clients</h2>
+            <div id="dhcpTableContainer">
+                <div class="dhcp-empty">No clients connected</div>
+            </div>
         </div>
 
         <div class="card">
@@ -298,14 +339,107 @@ static esp_err_t root_get_handler(httpd_req_t* req)
             updThr('usbRX',d.usb_down_bps||0,'usbRXbar');
             updThr('usbTX',d.usb_up_bps||0,'usbTXbar');
 
-            if(d.sta_ssid)document.getElementById('ssid').value=d.sta_ssid;
-            if(d.sta_password)document.getElementById('password').value=d.sta_password;
-            if(d.ap_ssid)document.getElementById('apSsid').value=d.ap_ssid;
-            if(d.ap_password)document.getElementById('apPassword').value=d.ap_password;
+            var elSsid=document.getElementById('ssid');
+            var elPass=document.getElementById('password');
+            if(d.sta_ssid && !elSsid.value)elSsid.value=d.sta_ssid;
+            if(d.sta_password && !elPass.value)elPass.value=d.sta_password;
+            var elApSsid=document.getElementById('apSsid');
+            var elApPass=document.getElementById('apPassword');
+            if(d.ap_ssid && !elApSsid.value)elApSsid.value=d.ap_ssid;
+            if(d.ap_password && !elApPass.value)elApPass.value=d.ap_password;
         }
 
         function updateStatus(){
             fetch('/api/wifi/status').then(function(r){return r.json()}).then(updateUI);
+        }
+
+        function updateDhcpClients(){
+            fetch('/api/dhcp/clients').then(function(r){return r.json()}).then(function(data){
+                var container=document.getElementById('dhcpTableContainer');
+                if(!data||data.length===0){
+                    container.innerHTML='<div class="dhcp-empty">No clients connected</div>';
+                    return;
+                }
+                var html='<table class="dhcp-table"><thead><tr><th>Interface</th><th>MAC Address</th><th>IP Address</th></tr></thead><tbody>';
+                for(var i=0;i<data.length;i++){
+                    var c=data[i];
+                    var iface=c.source==='ap'?'<span class="dhcp-badge dhcp-badge-ap">AP</span>':'<span class="dhcp-badge dhcp-badge-usb">USB</span>';
+                    html+='<tr><td>'+iface+'</td><td>'+c.mac+'</td><td>'+c.ip+'</td></tr>';
+                }
+                html+='</tbody></table>';
+                container.innerHTML=html;
+            });
+        }
+
+        function rssiToStr(r){
+            if(r>=-50)return'Excellent';
+            if(r>=-65)return'Good';
+            if(r>=-75)return'Fair';
+            return'Weak';
+        }
+
+        var scanTimer=null;
+        function startScan(){
+            var btn=document.getElementById('scanBtn');
+            var container=document.getElementById('scanContainer');
+            var statusEl=document.getElementById('scanStatus');
+            var spinner=document.getElementById('scanSpinner');
+            var list=document.getElementById('scanList');
+            if(scanTimer){clearInterval(scanTimer);scanTimer=null;}
+            btn.disabled=true;
+            btn.textContent='Scanning...';
+            container.style.display='block';
+            spinner.style.display='inline-block';
+            statusEl.textContent='Scanning for WiFi networks...';
+            list.innerHTML='';
+            function poll(){
+                fetch('/api/wifi/scan?_='+Date.now()).then(function(r){return r.json()}).then(function(data){
+                    if(data.scanning){
+                        return;
+                    }
+                    clearInterval(scanTimer);
+                    scanTimer=null;
+                    spinner.style.display='none';
+                    btn.disabled=false;
+                    btn.textContent='Scan Networks';
+                    if(data.error){
+                        statusEl.textContent='Scan failed: '+data.error;
+                        return;
+                    }
+                    if(!data.results||data.results.length===0){
+                        statusEl.textContent='No networks found';
+                        return;
+                    }
+                    statusEl.textContent=data.results.length+' network(s) found';
+                    var html='';
+                    for(var i=0;i<data.results.length;i++){
+                        var ap=data.results[i];
+                        var iconCls=ap.auth==='secure'?'scan-item-icon-secure':'scan-item-icon-open';
+                        var icon=ap.auth==='secure'?'&#128274;':'&#128275;';
+                        html+='<div class="scan-item" onclick="selectSSID(this.getAttribute(\'data-ssid\'))" data-ssid="'+ap.ssid.replace(/"/g,'&quot;').replace(/&/g,'&amp;')+'">';
+                        html+='<div class="scan-item-icon '+iconCls+'">'+icon+'</div>';
+                        html+='<div class="scan-item-info">';
+                        html+='<div class="scan-item-ssid">'+ap.ssid+'</div>';
+                        html+='<div class="scan-item-meta">CH '+ap.channel+' &middot; '+rssiToStr(ap.rssi)+' ('+ap.rssi+' dBm)</div>';
+                        html+='</div></div>';
+                    }
+                    list.innerHTML=html;
+                }).catch(function(){
+                    clearInterval(scanTimer);scanTimer=null;
+                    spinner.style.display='none';
+                    btn.disabled=false;
+                    btn.textContent='Scan Networks';
+                    statusEl.textContent='Scan failed';
+                });
+            }
+            poll();
+            scanTimer=setInterval(poll,500);
+        }
+
+        function selectSSID(ssid){
+            document.getElementById('ssid').value=ssid;
+            document.getElementById('scanContainer').style.display='none';
+            showToast('Selected: '+ssid,'success');
         }
 
         function connectWiFi(){
@@ -358,6 +492,8 @@ static esp_err_t root_get_handler(httpd_req_t* req)
 
         updateStatus();
         setInterval(updateStatus,2000);
+        updateDhcpClients();
+        setInterval(updateDhcpClients,5000);
         setInterval(updateUptime,1000);
     </script>
 </body>
@@ -502,13 +638,142 @@ static esp_err_t api_restart_handler(httpd_req_t* req)
     return ESP_OK;
 }
 
+static esp_err_t api_dhcp_clients_handler(httpd_req_t* req)
+{
+    char buffer[768];
+    wifi_service_get_dhcp_clients_json(buffer, sizeof(buffer));
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, buffer, strlen(buffer));
+    return ESP_OK;
+}
+
+static void json_escape_ssid(const uint8_t* src, char* dst, int dst_size)
+{
+    int w = 0;
+    int end = dst_size - 7;
+    for (int j = 0; j < 32 && w < end && src[j]; j++) {
+        unsigned char c = src[j];
+        if (c == '"')       { dst[w++] = '\\'; dst[w++] = '"'; }
+        else if (c == '\\') { dst[w++] = '\\'; dst[w++] = '\\'; }
+        else if (c == '\b') { dst[w++] = '\\'; dst[w++] = 'b'; }
+        else if (c == '\f') { dst[w++] = '\\'; dst[w++] = 'f'; }
+        else if (c == '\n') { dst[w++] = '\\'; dst[w++] = 'n'; }
+        else if (c == '\r') { dst[w++] = '\\'; dst[w++] = 'r'; }
+        else if (c == '\t') { dst[w++] = '\\'; dst[w++] = 't'; }
+        else if (c < 0x20)  {
+            w += snprintf(dst + w, dst_size - w, "\\u%04x", c);
+        }
+        else { dst[w++] = (char)c; }
+    }
+    dst[w] = '\0';
+}
+
+static char s_scan_json[4096] = {0};
+static bool s_scan_ready = false;
+static bool s_scan_running = false;
+
+static void scan_task(void* arg)
+{
+    esp_err_t ret = esp_wifi_scan_start(NULL, true);
+    if (ret != ESP_OK) {
+        snprintf(s_scan_json, sizeof(s_scan_json),
+                 "{\"error\":\"scan failed: %d\",\"results\":[]}", ret);
+        s_scan_ready = true;
+        s_scan_running = false;
+        ESP_LOGE(TAG, "Scan failed: %d", ret);
+        vTaskDelete(NULL);
+        return;
+    }
+
+    uint16_t ap_num = 0;
+    esp_wifi_scan_get_ap_num(&ap_num);
+    if (ap_num == 0) {
+        snprintf(s_scan_json, sizeof(s_scan_json), "{\"results\":[]}");
+        s_scan_ready = true;
+        s_scan_running = false;
+        vTaskDelete(NULL);
+        return;
+    }
+
+    wifi_ap_record_t* ap_records = (wifi_ap_record_t*)malloc(
+        ap_num * sizeof(wifi_ap_record_t));
+    if (!ap_records) {
+        snprintf(s_scan_json, sizeof(s_scan_json), "{\"results\":[]}");
+        s_scan_ready = true;
+        s_scan_running = false;
+        vTaskDelete(NULL);
+        return;
+    }
+
+    esp_wifi_scan_get_ap_records(&ap_num, ap_records);
+
+    int pos = snprintf(s_scan_json, sizeof(s_scan_json), "{\"results\":[");
+    char escaped[96];
+    for (int i = 0; i < (int)ap_num && pos < (int)sizeof(s_scan_json) - 150; i++) {
+        json_escape_ssid(ap_records[i].ssid, escaped, sizeof(escaped));
+
+        int rssi = ap_records[i].rssi;
+        int auth = (int)ap_records[i].authmode;
+        const char* auth_str = "open";
+        if (auth == WIFI_AUTH_WPA2_PSK || auth == WIFI_AUTH_WPA3_PSK ||
+            auth == WIFI_AUTH_WPA2_WPA3_PSK)
+            auth_str = "secure";
+        else if (auth != WIFI_AUTH_OPEN)
+            auth_str = "wep";
+
+        pos += snprintf(s_scan_json + pos, sizeof(s_scan_json) - pos,
+                        "%s{\"ssid\":\"%s\",\"rssi\":%d,\"channel\":%d,\"auth\":\"%s\"}",
+                        i > 0 ? "," : "",
+                        escaped, rssi,
+                        ap_records[i].primary, auth_str);
+    }
+    snprintf(s_scan_json + pos, sizeof(s_scan_json) - pos, "]}");
+    free(ap_records);
+
+    ESP_LOGI(TAG, "Scan done: %d APs, JSON: %d bytes", ap_num, (int)strlen(s_scan_json));
+    s_scan_ready = true;
+    s_scan_running = false;
+    vTaskDelete(NULL);
+}
+
+static esp_err_t api_wifi_scan_handler(httpd_req_t* req)
+{
+    httpd_resp_set_hdr(req, "Cache-Control", "no-cache, no-store, must-revalidate");
+    httpd_resp_set_type(req, "application/json");
+
+    wifi_mode_t mode;
+    esp_wifi_get_mode(&mode);
+    if (mode != WIFI_MODE_STA && mode != WIFI_MODE_APSTA) {
+        httpd_resp_send(req, "{\"error\":\"STA not active\",\"results\":[]}",
+                        HTTPD_RESP_USE_STRLEN);
+        return ESP_OK;
+    }
+
+    if (s_scan_ready) {
+        httpd_resp_send(req, s_scan_json, strlen(s_scan_json));
+        s_scan_ready = false;
+        return ESP_OK;
+    }
+
+    if (!s_scan_running) {
+        esp_wifi_scan_stop();
+        s_scan_running = true;
+        s_scan_ready = false;
+        xTaskCreate(scan_task, "scan", 4096, NULL, 5, NULL);
+    }
+
+    httpd_resp_send(req, "{\"scanning\":true}", HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+
 } // extern "C"
 
 void web_server_start(WebServer* ws)
 {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
-    config.server_port = 80;
-    config.stack_size  = 8192;
+    config.server_port      = 80;
+    config.max_uri_handlers = 16;
+    config.stack_size       = 16384;
 
     httpd_uri_t root_uri     = { .uri = "/", .method = HTTP_GET, .handler = root_get_handler, .user_ctx = NULL };
     httpd_uri_t status_uri   = { .uri = "/api/wifi/status", .method = HTTP_GET, .handler = api_wifi_status_handler, .user_ctx = NULL };
@@ -517,6 +782,8 @@ void web_server_start(WebServer* ws)
     httpd_uri_t ap_start_uri = { .uri = "/api/wifi/ap/start", .method = HTTP_POST, .handler = api_ap_start_handler, .user_ctx = NULL };
     httpd_uri_t ap_stop_uri  = { .uri = "/api/wifi/ap/stop", .method = HTTP_POST, .handler = api_ap_stop_handler, .user_ctx = NULL };
     httpd_uri_t restart_uri  = { .uri = "/api/restart", .method = HTTP_POST, .handler = api_restart_handler, .user_ctx = NULL };
+    httpd_uri_t dhcp_uri     = { .uri = "/api/dhcp/clients", .method = HTTP_GET, .handler = api_dhcp_clients_handler, .user_ctx = NULL };
+    httpd_uri_t scan_uri     = { .uri = "/api/wifi/scan", .method = HTTP_GET, .handler = api_wifi_scan_handler, .user_ctx = NULL };
 
     if (httpd_start(&ws->server, &config) == ESP_OK) {
         httpd_register_uri_handler(ws->server, &root_uri);
@@ -526,6 +793,8 @@ void web_server_start(WebServer* ws)
         httpd_register_uri_handler(ws->server, &ap_start_uri);
         httpd_register_uri_handler(ws->server, &ap_stop_uri);
         httpd_register_uri_handler(ws->server, &restart_uri);
+        httpd_register_uri_handler(ws->server, &dhcp_uri);
+        httpd_register_uri_handler(ws->server, &scan_uri);
         ESP_LOGI(TAG, "Web server started on port 80");
     }
 }

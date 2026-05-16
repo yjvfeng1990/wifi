@@ -57,6 +57,17 @@ static esp_timer_handle_t s_stats_timer = NULL;
 static QueueHandle_t  s_cmd_queue       = NULL;
 static SemaphoreHandle_t s_status_mutex = NULL;
 
+static dhcp_client_info_t s_dhcp_clients[DHCP_CLIENT_MAX];
+static int                s_dhcp_client_count = 0;
+static SemaphoreHandle_t  s_dhcp_mutex = NULL;
+
+static wifi_scan_item_t    s_scan_cache[WIFI_SCAN_MAX_RESULTS];
+static int                 s_scan_count = 0;
+static bool                s_scan_ready = false;
+static bool                s_scan_running = false;
+
+static void collect_scan_results(void);
+
 static struct netif* find_netif_by_name(const char* name);
 
 static uint64_t s_sta_down_last = 0;
@@ -450,6 +461,17 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base,
             xSemaphoreGive(s_status_mutex);
             ESP_LOGI(TAG, "AP client disconnected: " MACSTR ", total: %d",
                      MAC2STR(event->mac), clients);
+
+            xSemaphoreTake(s_dhcp_mutex, portMAX_DELAY);
+            for (int i = 0; i < s_dhcp_client_count; i++) {
+                if (s_dhcp_clients[i].source == DHCP_CLIENT_SRC_AP &&
+                    memcmp(s_dhcp_clients[i].mac, event->mac, 6) == 0) {
+                    s_dhcp_clients[i] = s_dhcp_clients[s_dhcp_client_count - 1];
+                    s_dhcp_client_count--;
+                    break;
+                }
+            }
+            xSemaphoreGive(s_dhcp_mutex);
             break;
         }
 
@@ -501,6 +523,34 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base,
 
             esp_netif_set_default_netif(s_sta_netif);
             enable_napt();
+        } else if (event_id == IP_EVENT_ASSIGNED_IP_TO_CLIENT) {
+            ip_event_assigned_ip_to_client_t* evt =
+                (ip_event_assigned_ip_to_client_t*)event_data;
+
+            xSemaphoreTake(s_dhcp_mutex, portMAX_DELAY);
+            bool found = false;
+            for (int i = 0; i < s_dhcp_client_count; i++) {
+                if (s_dhcp_clients[i].source == DHCP_CLIENT_SRC_USB &&
+                    memcmp(s_dhcp_clients[i].mac, evt->mac, 6) == 0) {
+                    snprintf(s_dhcp_clients[i].ip, sizeof(s_dhcp_clients[i].ip),
+                             IPSTR, IP2STR(&evt->ip));
+                    found = true;
+                    break;
+                }
+            }
+            if (!found && s_dhcp_client_count < DHCP_CLIENT_MAX) {
+                dhcp_client_info_t* c = &s_dhcp_clients[s_dhcp_client_count];
+                c->source = (evt->esp_netif == s_ap_netif) ? DHCP_CLIENT_SRC_AP
+                                                           : DHCP_CLIENT_SRC_USB;
+                memcpy(c->mac, evt->mac, 6);
+                snprintf(c->ip, sizeof(c->ip), IPSTR, IP2STR(&evt->ip));
+                s_dhcp_client_count++;
+            }
+            xSemaphoreGive(s_dhcp_mutex);
+
+            ESP_LOGI(TAG, "DHCP assigned: " MACSTR " -> " IPSTR " (%s)",
+                     MAC2STR(evt->mac), IP2STR(&evt->ip),
+                     (evt->esp_netif == s_ap_netif) ? "AP" : "USB");
         }
     }
 }
@@ -517,6 +567,7 @@ void wifi_service_init(void)
     s_wifi_events  = xEventGroupCreate();
     s_cmd_queue    = xQueueCreate(CMD_QUEUE_SIZE, sizeof(wifi_cmd_t));
     s_status_mutex = xSemaphoreCreateMutex();
+    s_dhcp_mutex   = xSemaphoreCreateMutex();
 
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
@@ -537,6 +588,8 @@ void wifi_service_init(void)
         WIFI_EVENT, ESP_EVENT_ANY_ID, wifi_event_handler, NULL));
     ESP_ERROR_CHECK(esp_event_handler_register(
         IP_EVENT, IP_EVENT_STA_GOT_IP, wifi_event_handler, NULL));
+    ESP_ERROR_CHECK(esp_event_handler_register(
+        IP_EVENT, IP_EVENT_ASSIGNED_IP_TO_CLIENT, wifi_event_handler, NULL));
 
     esp_timer_create_args_t timer_args = {
         .callback              = rssi_timer_callback,
@@ -614,6 +667,9 @@ void wifi_service_connect(const char* ssid, const char* password)
         s_sta_active = true;
         apply_wifi_mode(compute_wifi_mode(), false);
     }
+
+    esp_wifi_scan_stop();
+    esp_wifi_disconnect();
 
     wifi_config_t wifi_config = {};
     strncpy((char*)wifi_config.sta.ssid, ssid, sizeof(wifi_config.sta.ssid) - 1);
@@ -846,4 +902,146 @@ void wifi_service_get_status_json(char* buffer, size_t buffer_size)
         (unsigned long)status.ap_up_bps,
         (unsigned long)status.usb_down_bps,
         (unsigned long)status.usb_up_bps);
+}
+
+int wifi_service_get_dhcp_clients(dhcp_client_info_t* clients, int max_count)
+{
+    int count = 0;
+    xSemaphoreTake(s_dhcp_mutex, portMAX_DELAY);
+    for (int i = 0; i < s_dhcp_client_count && count < max_count; i++) {
+        clients[count] = s_dhcp_clients[i];
+        count++;
+    }
+    xSemaphoreGive(s_dhcp_mutex);
+    return count;
+}
+
+void wifi_service_get_dhcp_clients_json(char* buffer, size_t buffer_size)
+{
+    dhcp_client_info_t clients[DHCP_CLIENT_MAX];
+    int count = wifi_service_get_dhcp_clients(clients, DHCP_CLIENT_MAX);
+
+    int pos = snprintf(buffer, buffer_size, "[");
+    for (int i = 0; i < count; i++) {
+        char mac_str[18];
+        snprintf(mac_str, sizeof(mac_str),
+                 MACSTR, MAC2STR(clients[i].mac));
+        pos += snprintf(buffer + pos, buffer_size - pos,
+                        "%s{\"source\":\"%s\",\"mac\":\"%s\",\"ip\":\"%s\"}",
+                        i > 0 ? "," : "",
+                        clients[i].source == DHCP_CLIENT_SRC_AP ? "ap" : "usb",
+                        mac_str,
+                        clients[i].ip);
+    }
+    snprintf(buffer + pos, buffer_size - pos, "]");
+}
+
+static int compare_rssi(const void* a, const void* b)
+{
+    return ((wifi_scan_item_t*)b)->rssi - ((wifi_scan_item_t*)a)->rssi;
+}
+
+void wifi_service_scan_start(void)
+{
+    if (!s_wifi_events) return;
+
+    wifi_mode_t mode;
+    esp_wifi_get_mode(&mode);
+    if (mode != WIFI_MODE_STA && mode != WIFI_MODE_APSTA) {
+        ESP_LOGW(TAG, "Scan: STA not active, cannot scan");
+        return;
+    }
+
+    if (s_scan_running) {
+        ESP_LOGW(TAG, "Scan already in progress");
+        return;
+    }
+
+    esp_wifi_scan_stop();
+
+    wifi_scan_config_t scan_cfg = {};
+    scan_cfg.scan_type = WIFI_SCAN_TYPE_ACTIVE;
+    scan_cfg.scan_time.active.min = 100;
+    scan_cfg.scan_time.active.max = 300;
+
+    s_scan_ready = false;
+    s_scan_count = 0;
+    s_scan_running = true;
+
+    esp_err_t ret = esp_wifi_scan_start(&scan_cfg, false);
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "Scan start failed: %d (%s)", ret, esp_err_to_name(ret));
+        s_scan_running = false;
+    } else {
+        ESP_LOGI(TAG, "WiFi scan started");
+    }
+}
+
+static void collect_scan_results(void)
+{
+    uint16_t ap_num = 0;
+    esp_wifi_scan_get_ap_num(&ap_num);
+    if (ap_num == 0) {
+        s_scan_count = 0;
+        s_scan_ready = true;
+        s_scan_running = false;
+        return;
+    }
+
+    int count = (ap_num < WIFI_SCAN_MAX_RESULTS) ? ap_num : WIFI_SCAN_MAX_RESULTS;
+    wifi_ap_record_t* ap_records = (wifi_ap_record_t*)malloc(ap_num * sizeof(wifi_ap_record_t));
+    if (!ap_records) {
+        s_scan_count = 0;
+        s_scan_ready = true;
+        s_scan_running = false;
+        return;
+    }
+
+    esp_wifi_scan_get_ap_records(&ap_num, ap_records);
+
+    xSemaphoreTake(s_status_mutex, portMAX_DELAY);
+    for (int i = 0; i < count; i++) {
+        strncpy(s_scan_cache[i].ssid, (char*)ap_records[i].ssid,
+                sizeof(s_scan_cache[i].ssid) - 1);
+        s_scan_cache[i].ssid[sizeof(s_scan_cache[i].ssid) - 1] = '\0';
+        s_scan_cache[i].rssi = ap_records[i].rssi;
+        s_scan_cache[i].channel = ap_records[i].primary;
+        s_scan_cache[i].authmode = (int)ap_records[i].authmode;
+    }
+    qsort(s_scan_cache, count, sizeof(wifi_scan_item_t), compare_rssi);
+    s_scan_count = count;
+    xSemaphoreGive(s_status_mutex);
+
+    free(ap_records);
+    s_scan_ready = true;
+    s_scan_running = false;
+    ESP_LOGI(TAG, "Scan done: %d APs found", count);
+}
+
+void wifi_service_get_scan_json(char* buffer, size_t buffer_size)
+{
+    xSemaphoreTake(s_status_mutex, portMAX_DELAY);
+    int count = s_scan_count;
+    int pos = snprintf(buffer, buffer_size, "{");
+    pos += snprintf(buffer + pos, buffer_size - pos,
+                    "\"running\":%s,\"count\":%d,\"results\":[",
+                    s_scan_running ? "true" : "false", count);
+    for (int i = 0; i < count; i++) {
+        const char* auth_str = "open";
+        if (s_scan_cache[i].authmode == WIFI_AUTH_WPA2_PSK ||
+            s_scan_cache[i].authmode == WIFI_AUTH_WPA3_PSK ||
+            s_scan_cache[i].authmode == WIFI_AUTH_WPA2_WPA3_PSK)
+            auth_str = "secure";
+        else if (s_scan_cache[i].authmode != WIFI_AUTH_OPEN)
+            auth_str = "wep";
+        pos += snprintf(buffer + pos, buffer_size - pos,
+                        "%s{\"ssid\":\"%s\",\"rssi\":%d,\"channel\":%d,\"auth\":\"%s\"}",
+                        i > 0 ? "," : "",
+                        s_scan_cache[i].ssid,
+                        s_scan_cache[i].rssi,
+                        s_scan_cache[i].channel,
+                        auth_str);
+    }
+    snprintf(buffer + pos, buffer_size - pos, "]}");
+    xSemaphoreGive(s_status_mutex);
 }

@@ -47,7 +47,7 @@ static esp_err_t netif_transmit(void* h, void* buffer, size_t len)
     esp_err_t ret = tinyusb_net_send_sync(buffer, (uint16_t)len, NULL, pdMS_TO_TICKS(500));
     if (ret != ESP_OK) {
         s_tx_fail_count++;
-        if (s_tx_fail_count <= 5 || (s_tx_fail_count % 50) == 0) {
+        if (s_tx_fail_count <= 3 || (s_tx_fail_count % 200) == 0) {
             ESP_LOGW(TAG, "TX failed: %d, len=%u (fail_cnt=%d, link_down=%d)",
                      ret, (unsigned)len, s_tx_fail_count, s_link_down);
         }
@@ -59,15 +59,6 @@ static esp_err_t netif_transmit(void* h, void* buffer, size_t len)
         return ESP_OK;
     }
 
-    if (s_link_down) {
-        ESP_LOGI(TAG, "Link recovered after %d TX failures, restarting DHCP...", s_tx_fail_count);
-        s_link_down = false;
-        tud_network_link_state(0, true);
-        if (s_dhcp_restart_timer) {
-            esp_timer_stop(s_dhcp_restart_timer);
-            esp_timer_start_once(s_dhcp_restart_timer, 500000);
-        }
-    }
     s_tx_fail_count = 0;
     s_usb_tx_total += len;
     return ESP_OK;
