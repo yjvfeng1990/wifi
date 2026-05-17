@@ -36,7 +36,7 @@ static const char* NVS_KEY_AP_PASS = "ap_pass";
 #define WIFI_FAIL_BIT           BIT1
 #define AP_MAX_CONNECTIONS      4
 #define AP_DEFAULT_CHANNEL      1
-#define DEFAULT_AP_SSID         "ESP32-S3-Config"
+#define DEFAULT_AP_SSID         "ESP32-S3-AP"
 #define DEFAULT_AP_PASSWORD     "12345678"
 
 static bool           s_sta_active      = true;
@@ -269,8 +269,6 @@ static void disable_napt_for_netif(esp_netif_t* esp_netif)
 
 static void enable_napt(void)
 {
-    if (s_napt_enabled) return;
-
     esp_netif_t* usb_netif = usb_network_get_netif();
     enable_napt_for_netif(usb_netif);
     enable_napt_for_netif(s_ap_netif);
@@ -477,6 +475,20 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base,
 
         case WIFI_EVENT_AP_START:
             ESP_LOGI(TAG, "WiFi AP started");
+
+            xSemaphoreTake(s_status_mutex, portMAX_DELAY);
+            s_ap_clients = 0;
+            xSemaphoreGive(s_status_mutex);
+
+            xSemaphoreTake(s_dhcp_mutex, portMAX_DELAY);
+            for (int i = s_dhcp_client_count - 1; i >= 0; i--) {
+                if (s_dhcp_clients[i].source == DHCP_CLIENT_SRC_AP) {
+                    s_dhcp_clients[i] = s_dhcp_clients[s_dhcp_client_count - 1];
+                    s_dhcp_client_count--;
+                }
+            }
+            xSemaphoreGive(s_dhcp_mutex);
+
             if (s_ap_netif) {
                 uint32_t lease_seconds = 3600;
                 esp_netif_dhcps_option(s_ap_netif, ESP_NETIF_OP_SET,
@@ -494,9 +506,13 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base,
                 IP4_ADDR(&ap_dns.ip.u_addr.ip4, 8, 8, 8, 8);
                 esp_netif_set_dns_info(s_ap_netif, ESP_NETIF_DNS_MAIN, &ap_dns);
 
-                esp_netif_dhcps_start(s_ap_netif);
+                esp_err_t dhcps_ret = esp_netif_dhcps_start(s_ap_netif);
+                ESP_LOGI(TAG, "AP DHCP started: ret=%d, DNS=8.8.8.8", dhcps_ret);
+            }
 
-                ESP_LOGI(TAG, "AP DHCP: DNS=8.8.8.8");
+            if (s_napt_enabled) {
+                enable_napt_for_netif(s_ap_netif);
+                ESP_LOGI(TAG, "NAPT re-applied for AP netif");
             }
             break;
 
@@ -618,6 +634,13 @@ void wifi_service_init(void)
         if (nvs_get_u8(handle, NVS_KEY_MODE, &val) == ESP_OK) {
             saved_mode = (wifi_op_mode_t)val;
         }
+
+        size_t len = sizeof(s_ap_ssid);
+        nvs_get_str(handle, NVS_KEY_AP_SSID, s_ap_ssid, &len);
+
+        len = sizeof(s_ap_password);
+        nvs_get_str(handle, NVS_KEY_AP_PASS, s_ap_password, &len);
+
         nvs_close(handle);
     }
 
@@ -783,6 +806,18 @@ void wifi_service_start_ap(const char* ssid, const char* password)
         nvs_set_str(handle, NVS_KEY_AP_PASS, s_ap_password);
         nvs_commit(handle);
         nvs_close(handle);
+    }
+
+    if (s_ap_active) {
+        wifi_config_t ap_cfg = {};
+        strncpy((char*)ap_cfg.ap.ssid, s_ap_ssid, sizeof(ap_cfg.ap.ssid) - 1);
+        strncpy((char*)ap_cfg.ap.password, s_ap_password, sizeof(ap_cfg.ap.password) - 1);
+        ap_cfg.ap.max_connection = AP_MAX_CONNECTIONS;
+        ap_cfg.ap.authmode = WIFI_AUTH_WPA2_PSK;
+        ap_cfg.ap.channel = AP_DEFAULT_CHANNEL;
+        esp_wifi_set_config(WIFI_IF_AP, &ap_cfg);
+        ESP_LOGI(TAG, "AP updated: SSID=%s", s_ap_ssid);
+        return;
     }
 
     s_ap_active = true;
