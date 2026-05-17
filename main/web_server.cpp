@@ -8,6 +8,8 @@
 #include "freertos/task.h"
 #include "web_server.h"
 #include "wifi_service.h"
+#include "ble_pairing.h"
+#include "wifi_now.h"
 
 static const char* TAG = "WEB_SRV";
 
@@ -107,6 +109,17 @@ static esp_err_t root_get_handler(httpd_req_t* req)
         .scan-item-info{flex:1;min-width:0}
         .scan-item-ssid{font-weight:500;font-size:clamp(12px,2.5vw,14px);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
         .scan-item-meta{font-size:clamp(9px,2vw,11px);color:#8892b0;margin-top:1px}
+        .ble-toggle-btn{display:inline-flex;align-items:center;gap:8px;padding:clamp(8px,2vw,12px) clamp(14px,3vw,20px);border:none;border-radius:clamp(6px,1.5vw,8px);font-size:clamp(11px,2.5vw,13px);font-weight:600;cursor:pointer;transition:all 0.3s;text-transform:uppercase;letter-spacing:0.5px}
+        .ble-toggle-on{background:linear-gradient(135deg,#00ff88,#00cc6a);color:#111}
+        .ble-toggle-off{background:rgba(255,68,68,0.2);color:#ff6666;border:1px solid rgba(255,68,68,0.3)}
+        .ble-toggle-on:hover{box-shadow:0 4px 16px rgba(0,255,136,0.3)}
+        .ble-toggle-off:hover{background:rgba(255,68,68,0.3)}
+        .mac-box{background:rgba(0,200,255,0.1);border:1px solid rgba(0,200,255,0.2);padding:clamp(6px,1.5vw,10px) clamp(10px,3vw,15px);border-radius:clamp(6px,1.5vw,8px);font-family:monospace;font-size:clamp(12px,2.5vw,14px);color:#00c8ff;word-break:break-all}
+        .btn-pair{background:rgba(0,200,255,0.15);color:#00c8ff;border:1px solid rgba(0,200,255,0.3);padding:clamp(4px,1.5vw,6px) clamp(10px,3vw,14px);border-radius:clamp(4px,1vw,6px);font-size:clamp(10px,2vw,12px);font-weight:600;cursor:pointer;transition:all 0.2s;white-space:nowrap}
+        .btn-pair:hover{background:rgba(0,200,255,0.25)}
+        .btn-mini{background:rgba(255,68,68,0.15);color:#ff6666;border:none;padding:2px 8px;border-radius:4px;font-size:10px;cursor:pointer}
+        .btn-mini:hover{background:rgba(255,68,68,0.3)}
+        .rssi-small{font-size:clamp(9px,2vw,11px);color:#8892b0}
         @media(min-width:640px){
             .thr-grid{grid-template-columns:repeat(auto-fit,minmax(200px,1fr))}
             .status-grid{grid-template-columns:repeat(auto-fit,minmax(160px,1fr))}
@@ -245,6 +258,38 @@ static esp_err_t root_get_handler(httpd_req_t* req)
             <h2>DHCP Clients</h2>
             <div id="dhcpTableContainer">
                 <div class="dhcp-empty">No clients connected</div>
+            </div>
+        </div>
+
+        <div class="card">
+            <h2><span class="dot dot-offline" id="bleDot"></span> BLE Pairing</h2>
+            <div style="margin-bottom:12px">
+                <div class="status-label" style="margin-bottom:4px">ESP-NOW MAC</div>
+                <div class="mac-box" id="nowMac">--</div>
+            </div>
+            <div style="display:flex;gap:8px;align-items:flex-end;flex-wrap:wrap;margin-bottom:12px">
+                <div class="form-group" style="flex:1;min-width:120px;margin-bottom:0">
+                    <label for="bleName">Device Name</label>
+                    <input type="text" id="bleName" placeholder="ESP32-S3-NOW" style="font-size:clamp(12px,2.5vw,14px)">
+                </div>
+                <div>
+                    <button class="ble-toggle-btn ble-toggle-off" id="bleAdvBtn" onclick="toggleAdvertise()">Start BLE</button>
+                </div>
+            </div>
+            <div style="display:flex;gap:8px;align-items:center;margin-bottom:8px">
+                <button class="scan-btn" id="bleScanBtn" onclick="startBleScan()">Scan BLE Devices</button>
+                <span class="scan-spinner" id="bleScanSpinner" style="display:none"></span>
+                <span style="font-size:12px;color:#8892b0" id="bleScanStatus"></span>
+            </div>
+            <div class="scan-list" id="bleDevList" style="max-height:200px">
+                <div class="dhcp-empty">No devices discovered</div>
+            </div>
+        </div>
+
+        <div class="card">
+            <h2>ESP-NOW Peer List</h2>
+            <div id="peerTableContainer">
+                <div class="dhcp-empty">No peers paired</div>
             </div>
         </div>
 
@@ -489,6 +534,116 @@ static esp_err_t root_get_handler(httpd_req_t* req)
             fetch('/api/restart',{method:'POST'}).then(function(){showToast('Restarting...','success')});
         }
 
+        function updateNowMac(){
+            fetch('/api/now/mac').then(function(r){return r.json()}).then(function(d){
+                document.getElementById('nowMac').textContent=d.mac||'--';
+            });
+        }
+
+        function updateBleStatus(){
+            fetch('/api/ble/status').then(function(r){return r.json()}).then(function(d){
+                var btn=document.getElementById('bleAdvBtn');
+                var dot=document.getElementById('bleDot');
+                if(d.advertising){
+                    btn.textContent='Stop BLE';
+                    btn.className='ble-toggle-btn ble-toggle-on';
+                    dot.className='dot dot-online';
+                }else{
+                    btn.textContent='Start BLE';
+                    btn.className='ble-toggle-btn ble-toggle-off';
+                    dot.className='dot dot-offline';
+                }
+                if(d.scanning){
+                    document.getElementById('bleScanSpinner').style.display='inline-block';
+                }
+            });
+        }
+
+        function toggleAdvertise(){
+            fetch('/api/ble/status').then(function(r){return r.json()}).then(function(d){
+                var name=document.getElementById('bleName').value.trim();
+                var enable=d.advertising?'0':'1';
+                fetch('/api/ble/advertise',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'enable='+enable+'&name='+encodeURIComponent(name)}).then(function(r){return r.json()}).then(function(){
+                    updateBleStatus();
+                    showToast(d.advertising?'BLE stopped':'BLE advertising started','success');
+                });
+            });
+        }
+
+        var bleScanTimer=null;
+        function startBleScan(){
+            var btn=document.getElementById('bleScanBtn');
+            if(bleScanTimer){clearInterval(bleScanTimer);bleScanTimer=null;}
+            btn.disabled=true;
+            btn.textContent='Scanning...';
+            document.getElementById('bleScanSpinner').style.display='inline-block';
+            document.getElementById('bleScanStatus').textContent='Scanning for BLE devices...';
+            document.getElementById('bleDevList').innerHTML='<div class="dhcp-empty">Scanning...</div>';
+            fetch('/api/ble/scan',{method:'POST'});
+            function poll(){
+                fetch('/api/ble/devices?_='+Date.now()).then(function(r){return r.json()}).then(function(data){
+                    var html='';
+                    if(data.devices&&data.devices.length>0){
+                        for(var i=0;i<data.devices.length;i++){
+                            var d=data.devices[i];
+                            html+='<div class="scan-item">';
+                            html+='<div class="scan-item-icon scan-item-icon-secure">&#128206;</div>';
+                            html+='<div class="scan-item-info">';
+                            html+='<div class="scan-item-ssid">'+d.name+'</div>';
+                            html+='<div class="scan-item-meta">NOW: '+d.now_mac+' &middot; RSSI: '+d.rssi+' dBm</div>';
+                            html+='</div>';
+                            html+='<button class="btn-pair" onclick="pairDevice('+d.index+')">Pair</button>';
+                            html+='</div>';
+                        }
+                    }else if(!data.scanning){
+                        html='<div class="dhcp-empty">No devices discovered</div>';
+                    }
+                    if(html)document.getElementById('bleDevList').innerHTML=html;
+                    if(!data.scanning){
+                        clearInterval(bleScanTimer);bleScanTimer=null;
+                        btn.disabled=false;btn.textContent='Scan BLE Devices';
+                        document.getElementById('bleScanSpinner').style.display='none';
+                        document.getElementById('bleScanStatus').textContent=data.devices&&data.devices.length>0?data.devices.length+' device(s) found':'No devices found';
+                        updateNowPeers();
+                    }
+                });
+            }
+            poll();
+            bleScanTimer=setInterval(poll,800);
+        }
+
+        function pairDevice(index){
+            fetch('/api/ble/pair',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'index='+index}).then(function(r){return r.json()}).then(function(){
+                showToast('Device paired','success');
+                setTimeout(updateNowPeers,500);
+            });
+        }
+
+        function updateNowPeers(){
+            fetch('/api/now/peers').then(function(r){return r.json()}).then(function(data){
+                var container=document.getElementById('peerTableContainer');
+                if(!data||data.length===0){
+                    container.innerHTML='<div class="dhcp-empty">No peers paired</div>';
+                    return;
+                }
+                var html='<table class="dhcp-table"><thead><tr><th>Name</th><th>ESP-NOW MAC</th><th>Channel</th><th></th></tr></thead><tbody>';
+                for(var i=0;i<data.length;i++){
+                    var p=data[i];
+                    html+='<tr><td>'+p.name+'</td><td>'+p.mac+'</td><td>'+p.channel+'</td>';
+                    html+='<td><button class="btn-mini" onclick="removePeer(\''+p.mac+'\')">Remove</button></td></tr>';
+                }
+                html+='</tbody></table>';
+                container.innerHTML=html;
+            });
+        }
+
+        function removePeer(mac){
+            fetch('/api/now/peer/remove',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'mac='+encodeURIComponent(mac)}).then(function(r){return r.json()}).then(function(){
+                showToast('Peer removed','success');
+                updateNowPeers();
+            });
+        }
+
         function updateUptime(){
             var s=Math.floor(Date.now()/1000)-startTime;
             var d=Math.floor(s/86400),h=Math.floor(s%86400/3600),m=Math.floor(s%3600/60),sec=s%60;
@@ -500,6 +655,11 @@ static esp_err_t root_get_handler(httpd_req_t* req)
         setInterval(updateStatus,2000);
         updateDhcpClients();
         setInterval(updateDhcpClients,5000);
+        updateNowMac();
+        updateBleStatus();
+        setInterval(updateBleStatus,2000);
+        updateNowPeers();
+        setInterval(updateNowPeers,3000);
         setInterval(updateUptime,1000);
     </script>
 </body>
@@ -772,13 +932,150 @@ static esp_err_t api_wifi_scan_handler(httpd_req_t* req)
     return ESP_OK;
 }
 
+static esp_err_t api_ble_status_handler(httpd_req_t* req)
+{
+    ble_pair_state_t st = ble_pairing_get_state();
+    bool adv = ble_pairing_is_advertising();
+    bool scn = ble_pairing_is_scanning();
+    char buf[128];
+    snprintf(buf, sizeof(buf),
+             "{\"state\":%d,\"advertising\":%s,\"scanning\":%s}",
+             (int)st, adv ? "true" : "false", scn ? "true" : "false");
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, buf, strlen(buf));
+    return ESP_OK;
+}
+
+static esp_err_t api_ble_advertise_handler(httpd_req_t* req)
+{
+    char buf[128] = {0};
+    int ret = httpd_req_recv(req, buf, sizeof(buf) - 1);
+    if (ret > 0) {
+        buf[ret] = '\0';
+        char* en = strstr(buf, "enable=");
+        if (en) {
+            en += 7;
+            if (en[0] == '1' || en[0] == 't') {
+                char* name = strstr(buf, "name=");
+                const char* dev_name = NULL;
+                if (name) {
+                    name += 5;
+                    char* amp = strchr(name, '&');
+                    if (amp) *amp = '\0';
+                    dev_name = name;
+                }
+                ble_pairing_start_advertise(dev_name);
+            } else {
+                ble_pairing_stop_advertise();
+            }
+        }
+    }
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, "{\"success\":true}", HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+
+static esp_err_t api_ble_scan_handler(httpd_req_t* req)
+{
+    ble_pairing_start_scan(10);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, "{\"success\":true}", HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+
+static esp_err_t api_ble_devices_handler(httpd_req_t* req)
+{
+    ble_discovered_device_t devices[BLE_MAX_DISCOVERED];
+    int count = ble_pairing_get_discovered(devices, BLE_MAX_DISCOVERED);
+
+    char buf[2048];
+    int pos = snprintf(buf, sizeof(buf),
+                       "{\"scanning\":%s,\"devices\":[",
+                       ble_pairing_is_scanning() ? "true" : "false");
+    for (int i = 0; i < count; i++) {
+        char bmac[18], nmac[18];
+        snprintf(bmac, sizeof(bmac), MACSTR, MAC2STR(devices[i].mac));
+        snprintf(nmac, sizeof(nmac), MACSTR, MAC2STR(devices[i].now_mac));
+        pos += snprintf(buf + pos, sizeof(buf) - pos,
+                        "%s{\"index\":%d,\"ble_mac\":\"%s\","
+                        "\"now_mac\":\"%s\",\"name\":\"%s\",\"rssi\":%d}",
+                        i > 0 ? "," : "",
+                        i, bmac, nmac, devices[i].name, devices[i].rssi);
+    }
+    snprintf(buf + pos, sizeof(buf) - pos, "]}");
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, buf, strlen(buf));
+    return ESP_OK;
+}
+
+static esp_err_t api_ble_pair_handler(httpd_req_t* req)
+{
+    char buf[64] = {0};
+    int ret = httpd_req_recv(req, buf, sizeof(buf) - 1);
+    if (ret > 0) {
+        buf[ret] = '\0';
+        char* idx_str = strstr(buf, "index=");
+        if (idx_str) {
+            int idx = atoi(idx_str + 6);
+            ble_pairing_pair_with_device(idx);
+        }
+    }
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, "{\"success\":true}", HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+
+static esp_err_t api_now_peers_handler(httpd_req_t* req)
+{
+    char buffer[2048];
+    wifi_now_get_peers_json(buffer, sizeof(buffer));
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, buffer, strlen(buffer));
+    return ESP_OK;
+}
+
+static esp_err_t api_now_peer_remove_handler(httpd_req_t* req)
+{
+    char buf[128] = {0};
+    int ret = httpd_req_recv(req, buf, sizeof(buf) - 1);
+    if (ret > 0) {
+        buf[ret] = '\0';
+        char* mac_str = strstr(buf, "mac=");
+        if (mac_str) {
+            mac_str += 4;
+            uint8_t mac[6];
+            int vals[6];
+            if (sscanf(mac_str, "%x:%x:%x:%x:%x:%x",
+                       &vals[0], &vals[1], &vals[2],
+                       &vals[3], &vals[4], &vals[5]) == 6) {
+                for (int i = 0; i < 6; i++) mac[i] = (uint8_t)vals[i];
+                wifi_now_remove_peer(mac);
+            }
+        }
+    }
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, "{\"success\":true}", HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+
+static esp_err_t api_now_mac_handler(httpd_req_t* req)
+{
+    uint8_t* mac = ble_pairing_get_own_now_mac();
+    char buf[64];
+    snprintf(buf, sizeof(buf),
+             "{\"mac\":\"" MACSTR "\"}", MAC2STR(mac));
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, buf, strlen(buf));
+    return ESP_OK;
+}
+
 } // extern "C"
 
 void web_server_start(WebServer* ws)
 {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.server_port      = 80;
-    config.max_uri_handlers = 16;
+    config.max_uri_handlers = 24;
     config.stack_size       = 16384;
 
     httpd_uri_t root_uri     = { .uri = "/", .method = HTTP_GET, .handler = root_get_handler, .user_ctx = NULL };
@@ -790,6 +1087,14 @@ void web_server_start(WebServer* ws)
     httpd_uri_t restart_uri  = { .uri = "/api/restart", .method = HTTP_POST, .handler = api_restart_handler, .user_ctx = NULL };
     httpd_uri_t dhcp_uri     = { .uri = "/api/dhcp/clients", .method = HTTP_GET, .handler = api_dhcp_clients_handler, .user_ctx = NULL };
     httpd_uri_t scan_uri     = { .uri = "/api/wifi/scan", .method = HTTP_GET, .handler = api_wifi_scan_handler, .user_ctx = NULL };
+    httpd_uri_t ble_status_uri = { .uri = "/api/ble/status", .method = HTTP_GET, .handler = api_ble_status_handler, .user_ctx = NULL };
+    httpd_uri_t ble_adv_uri    = { .uri = "/api/ble/advertise", .method = HTTP_POST, .handler = api_ble_advertise_handler, .user_ctx = NULL };
+    httpd_uri_t ble_scan_uri   = { .uri = "/api/ble/scan", .method = HTTP_POST, .handler = api_ble_scan_handler, .user_ctx = NULL };
+    httpd_uri_t ble_dev_uri    = { .uri = "/api/ble/devices", .method = HTTP_GET, .handler = api_ble_devices_handler, .user_ctx = NULL };
+    httpd_uri_t ble_pair_uri   = { .uri = "/api/ble/pair", .method = HTTP_POST, .handler = api_ble_pair_handler, .user_ctx = NULL };
+    httpd_uri_t now_peers_uri  = { .uri = "/api/now/peers", .method = HTTP_GET, .handler = api_now_peers_handler, .user_ctx = NULL };
+    httpd_uri_t now_rm_uri     = { .uri = "/api/now/peer/remove", .method = HTTP_POST, .handler = api_now_peer_remove_handler, .user_ctx = NULL };
+    httpd_uri_t now_mac_uri    = { .uri = "/api/now/mac", .method = HTTP_GET, .handler = api_now_mac_handler, .user_ctx = NULL };
 
     if (httpd_start(&ws->server, &config) == ESP_OK) {
         httpd_register_uri_handler(ws->server, &root_uri);
@@ -801,6 +1106,14 @@ void web_server_start(WebServer* ws)
         httpd_register_uri_handler(ws->server, &restart_uri);
         httpd_register_uri_handler(ws->server, &dhcp_uri);
         httpd_register_uri_handler(ws->server, &scan_uri);
+        httpd_register_uri_handler(ws->server, &ble_status_uri);
+        httpd_register_uri_handler(ws->server, &ble_adv_uri);
+        httpd_register_uri_handler(ws->server, &ble_scan_uri);
+        httpd_register_uri_handler(ws->server, &ble_dev_uri);
+        httpd_register_uri_handler(ws->server, &ble_pair_uri);
+        httpd_register_uri_handler(ws->server, &now_peers_uri);
+        httpd_register_uri_handler(ws->server, &now_rm_uri);
+        httpd_register_uri_handler(ws->server, &now_mac_uri);
         ESP_LOGI(TAG, "Web server started on port 80");
     }
 }

@@ -9,6 +9,8 @@
 #include "usb_network.h"
 #include "wifi_service.h"
 #include "web_server.h"
+#include "ble_pairing.h"
+#include "wifi_now.h"
 
 static const char* TAG = "MAIN";
 
@@ -33,7 +35,13 @@ extern "C" void app_main(void)
     ESP_LOGI(TAG, "Step 2: Web Server start...");
     web_server_start(&g_webServer);
 
-    ESP_LOGI(TAG, "Step 3: USB reconnect...");
+    ESP_LOGI(TAG, "Step 3: ESP-NOW init...");
+    wifi_now_init();
+
+    ESP_LOGI(TAG, "Step 4: BLE Pairing init...");
+    ble_pairing_init();
+
+    ESP_LOGI(TAG, "Step 5: USB reconnect...");
     usb_network_reconnect();
 
     bool sta_should_connect = (mode == WIFI_OP_MODE_STA || mode == WIFI_OP_MODE_APSTA)
