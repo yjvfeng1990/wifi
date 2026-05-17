@@ -81,9 +81,10 @@ static esp_err_t netif_recv_callback(void* buffer, uint16_t len, void* ctx)
     memcpy(buf_copy, buffer, len);
 
     esp_err_t ret = esp_netif_receive(s_usb_netif, buf_copy, len, NULL);
-    if (ret != ESP_OK) {
-        ESP_LOGW(TAG, "RX esp_netif_receive err: %d, len=%u", ret, len);
-    } else {
+    if (ret != ESP_OK && ret != ESP_FAIL) {
+        ESP_LOGW(TAG, "RX esp_netif_receive err: 0x%x, len=%u", ret, len);
+    }
+    if (ret == ESP_OK) {
         s_usb_rx_total += len;
     }
     return ret;
