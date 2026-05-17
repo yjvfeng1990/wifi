@@ -17,6 +17,81 @@ ESP32-S3 实现三接口网络共享，支持 STA/AP/USB 同时运行，STA 作�
 - **DHCP 客户端列表**：Web 页面显示 AP 和 USB 下挂设备的 MAC 地址与 IP
 - **热插拔**：USB 断开/重连自动恢复 DHCP
 - **DNS 转发**：AP 和 USB 客户端通过 DHCP 自动获取 DNS 服务器
+- **ESP-NOW 通信**：低延迟点对点无线通信，支持广播/单播，无需 TCP/IP 栈
+- **BLE 配对**：通过蓝牙自动发现设备并交换 ESP-NOW MAC 地址，无需手动输入
+
+## ESP-NOW
+
+ESP-NOW 是乐鑫私有协议，可在 WiFi 射频上实现点对点高速通信（最高 ~1 Mbps），无需 AP，延迟极低，适合传感器数据透传、远程控制等场景。
+
+### 配对流程
+
+两个 ESP32-S3 节点配对无需手动输入 MAC 地址：
+
+```
+节点 A（开启 BLE 广播）          节点 B（扫描并配对）
+┌──────────────────────┐      ┌──────────────────────┐
+│ BLE 广播携带：        │      │ BLE 扫描发现 A       │
+│  - 'EN' 标识          │ ───→ │ 提取 ESP-NOW MAC     │
+│  - ESP-NOW MAC (6B)   │      │ 显示设备名/RSSI      │
+│  - 设备名称           │      │                      │
+└──────────────────────┘      │ 用户点击 "Pair"      │
+                               │  → 添加到 peer 列表  │
+                               │  → 保存到 Flash NVS  │
+                               └──────────────────────┘
+```
+
+- 设备 A 在 Web 页面设置设备名称，点击 **Start BLE**，开启 BLE 广播
+- 设备 B 点击 **Scan BLE Devices**，扫描周围设备
+- 发现设备后，点击 **Pair**，ESP-NOW MAC 自动加入 peer 列表
+- 配对信息自动存入 Flash NVS，重启后自动恢复
+
+### ESP-NOW Web API
+
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| GET | `/api/now/mac` | 获取本机 ESP-NOW MAC 地址 |
+| GET | `/api/now/peers` | 获取已配对 peer 列表（JSON） |
+| POST | `/api/now/peer/remove` | 按 MAC 地址移除 peer |
+
+### BLE 配对 Web API
+
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| GET | `/api/ble/status` | BLE 状态（广播/扫描） |
+| POST | `/api/ble/advertise` | 开启/关闭 BLE 广播，`enable=0/1&name=xxx` |
+| POST | `/api/ble/scan` | 启动 BLE 扫描（持续 10 秒） |
+| GET | `/api/ble/devices` | 获取已发现的 BLE 设备列表 |
+| POST | `/api/ble/pair` | 与指定设备配对，`index=N` |
+
+### BLE 广播数据格式
+
+设备通过 BLE 广播的厂商自定义数据（0xFF）携带 ESP-NOW 信息：
+
+| 字段 | 长度 | 说明 |
+|------|------|------|
+| MFG ID | 2B | 0xE502（自定义） |
+| Tag | 2B | `'E'` `'N'` 标识 |
+| ESP-NOW MAC | 6B | WiFi STA MAC 地址 |
+| 设备名称 | N 字节 | 可自定义的设备标识 |
+
+### 代码架构
+
+```
+wifi_now.h / wifi_now.c       — ESP-NOW 核心
+├── 初始化 / 反初始化
+├── Peer 管理（添加/移除/清空/NVS 持久化）
+├── 发送（单播/广播）
+├── 回调注册（收发回调）
+└── 信道管理
+
+ble_pairing.h / ble_pairing.c — BLE 配对层
+├── BLE 控制器初始化（Bluedroid）
+├── GAP 回调（扫描结果/广播状态）
+├── 广播构建（MPU 数据编码）
+├── 扫描解析（提取 ESP-NOW MAC）
+└── 配对触发 → wifi_now_add_peer()
+```
 
 ## 吞吐监控
 
@@ -70,6 +145,7 @@ python -m esptool --chip esp32s3 -p COM2 -b 460800 --before default-reset --afte
 | AP DHCP Lease | `3600s` | DHCP 租约时间 |
 | AP DNS | `8.8.8.8` | 下发给客户端的 DNS 服务器 |
 | USB IP | `192.168.5.1/24` | USB 网卡地址段 |
+| BLE 设备名 | `ESP32-S3-NOW` | BLE 广播中的设备标识 |
 
 ## Web API
 
@@ -83,6 +159,14 @@ python -m esptool --chip esp32s3 -p COM2 -b 460800 --before default-reset --afte
 | GET | `/api/wifi/scan` | 异步扫描：首次返回 `{"scanning":true}`，轮询至扫描完成后返回结果 JSON |
 | GET | `/api/dhcp/clients` | DHCP 客户端列表 |
 | POST | `/api/restart` | 重启设备 |
+| GET | `/api/ble/status` | BLE 状态 |
+| POST | `/api/ble/advertise` | 开启/关闭 BLE 广播 |
+| POST | `/api/ble/scan` | 启动 BLE 设备扫描 |
+| GET | `/api/ble/devices` | 已发现的 BLE 设备列表 |
+| POST | `/api/ble/pair` | 与指定 BLE 设备配对 |
+| GET | `/api/now/mac` | 本机 ESP-NOW MAC |
+| GET | `/api/now/peers` | ESP-NOW Peer 列表 |
+| POST | `/api/now/peer/remove` | 移除指定 Peer |
 
 ## 架构
 
@@ -95,6 +179,13 @@ python -m esptool --chip esp32s3 -p COM2 -b 460800 --before default-reset --afte
                                 │           │
                                 └───────────┘
                                    (IP forwarding + NAPT)
+
+ESP-NOW Mesh（独立于上述架构）
+   ┌─────────┐        ┌─────────┐        ┌─────────┐
+   │ 节点 A  │ ←────→ │ 节点 B  │ ←────→ │ 节点 C  │
+   │ (BLE配对)│        │         │        │         │
+   └─────────┘        └─────────┘        └─────────┘
+   通过 BLE 广播交换 ESP-NOW MAC，自动建立 peer 连接
 ```
 
 ## 已知问题与修复历史
@@ -130,7 +221,7 @@ SSID 可能包含 `"`、`&`、`'` 和不可见控制字符，直接拼入 HTML `
 
 ### HTTPD URI 路由表溢出
 
-`HTTPD_DEFAULT_CONFIG()` 默认 `max_uri_handlers = 8`。当注册超过 8 个路由时，`httpd_register_uri_handler()` 静默失败。手动增大至 `config.max_uri_handlers = 16`。
+`HTTPD_DEFAULT_CONFIG()` 默认 `max_uri_handlers = 8`。当注册超过 8 个路由时，`httpd_register_uri_handler()` 静默失败。已手动增大至 `config.max_uri_handlers = 24`。
 
 ### DHCP DNS 选项格式（ESP-IDF v6.0.1）
 
