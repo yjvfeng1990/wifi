@@ -47,9 +47,11 @@ static esp_err_t netif_transmit(void* h, void* buffer, size_t len)
     esp_err_t ret = tinyusb_net_send_sync(buffer, (uint16_t)len, NULL, pdMS_TO_TICKS(500));
     if (ret != ESP_OK) {
         s_tx_fail_count++;
-        if (s_tx_fail_count <= 3 || (s_tx_fail_count % 200) == 0) {
-            ESP_LOGW(TAG, "TX failed: %d, len=%u (fail_cnt=%d, link_down=%d)",
-                     ret, (unsigned)len, s_tx_fail_count, s_link_down);
+        if (ret != ESP_ERR_INVALID_STATE) {
+            if (s_tx_fail_count <= 3 || (s_tx_fail_count % 200) == 0) {
+                ESP_LOGW(TAG, "TX failed: 0x%x, len=%u (fail_cnt=%d)",
+                         ret, (unsigned)len, s_tx_fail_count);
+            }
         }
         if (!s_link_down && s_tx_fail_count > 30) {
             s_link_down = true;
