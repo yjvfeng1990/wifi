@@ -4,6 +4,7 @@
 #include "esp_system.h"
 #include "esp_timer.h"
 #include "esp_wifi.h"
+#include "esp_mac.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "web_server.h"
@@ -14,6 +15,17 @@
 static const char* TAG = "WEB_SRV";
 
 extern "C" {
+
+static bool s_ap_pairing_enabled = true;
+static void ap_client_connected_cb(const uint8_t* client_mac, const char* client_ip, void* user_data)
+{
+    if (!s_ap_pairing_enabled) {
+        return;
+    }
+
+    ESP_LOGI(TAG, "AP client connected: " MACSTR " (IP: %s), notifying peer registration",
+             MAC2STR(client_mac), client_ip);
+}
 
 static esp_err_t root_get_handler(httpd_req_t* req)
 {
@@ -66,6 +78,9 @@ static esp_err_t root_get_handler(httpd_req_t* req)
         .btn-ap-start:hover{transform:translateY(-1px);box-shadow:0 6px 20px rgba(0,200,255,0.3)}
         .btn-danger{background:rgba(255,68,68,0.15);color:#ff6666;margin-top:clamp(4px,1.5vw,8px)}
         .btn-danger:hover{background:rgba(255,68,68,0.25)}
+        select{width:100%;padding:clamp(9px,2.5vw,12px) clamp(10px,3vw,15px);background:rgba(255,255,255,0.05);border:1px solid rgba(255,255,255,0.1);border-radius:clamp(6px,1.5vw,8px);color:#e0e0e0;font-size:clamp(13px,3vw,15px);cursor:pointer;outline:none;appearance:none;-webkit-appearance:none;background-image:url('data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20width%3D%2212%22%20height%3D%2212%22%20viewBox%3D%220%200%2012%2012%22%3E%3Cpath%20fill%3D%22%238892b0%22%20d%3D%22M6%208L1%203h10z%22%2F%3E%3C%2Fsvg%3E');background-repeat:no-repeat;background-position:right 12px center;padding-right:32px}
+        select:focus{border-color:#e94560;box-shadow:0 0 0 3px rgba(233,69,96,0.15)}
+        option{background:#1a1a2e;color:#e0e0e0}
         .toast{position:fixed;top:10px;right:10px;padding:clamp(10px,2.5vw,14px) clamp(12px,3vw,20px);border-radius:clamp(6px,2vw,10px);color:white;font-weight:500;z-index:999;animation:slideIn 0.3s ease;display:none;font-size:clamp(12px,2.5vw,14px)}
         .toast-success{background:rgba(0,255,136,0.15);border:1px solid rgba(0,255,136,0.3);color:#00ff88}
         .toast-error{background:rgba(255,68,68,0.15);border:1px solid rgba(255,68,68,0.3);color:#ff6666}
@@ -290,6 +305,41 @@ static esp_err_t root_get_handler(httpd_req_t* req)
             <h2>ESP-NOW Peer List</h2>
             <div id="peerTableContainer">
                 <div class="dhcp-empty">No peers paired</div>
+            </div>
+        </div>
+
+        <div class="card">
+            <h2>ESP-NOW Message Tool</h2>
+            <div style="margin-bottom:16px">
+                <div class="status-label" style="margin-bottom:6px">Select Target Peer</div>
+                <select id="msgTargetPeer">
+                    <option value="">-- Select Peer --</option>
+                </select>
+            </div>
+            <div style="margin-bottom:16px">
+                <div class="status-label" style="margin-bottom:6px">Message Type</div>
+                <div style="display:flex;gap:8px;flex-wrap:wrap">
+                    <label style="display:flex;align-items:center;gap:6px;cursor:pointer;font-size:clamp(12px,2.5vw,14px)">
+                        <input type="radio" name="msgType" value="text" checked style="accent-color:#e94560"> Text
+                    </label>
+                    <label style="display:flex;align-items:center;gap:6px;cursor:pointer;font-size:clamp(12px,2.5vw,14px)">
+                        <input type="radio" name="msgType" value="hex" style="accent-color:#e94560"> Hex
+                    </label>
+                </div>
+            </div>
+            <div class="form-group">
+                <label for="msgData">Message Data</label>
+                <input type="text" id="msgData" placeholder="Enter message text or hex (e.g., 48656c6c6f)" style="font-family:monospace">
+            </div>
+            <div style="display:flex;gap:8px;margin-top:12px">
+                <button class="btn btn-primary" id="sendMsgBtn" onclick="sendEspnowMsg()" style="flex:1">Send to Peer</button>
+                <button class="btn btn-ap-start" id="broadcastMsgBtn" onclick="broadcastEspnowMsg()" style="flex:1">Broadcast All</button>
+            </div>
+            <div style="margin-top:12px">
+                <div class="status-label" style="margin-bottom:6px">Send Result</div>
+                <div id="msgResult" style="background:rgba(0,0,0,0.2);border:1px solid rgba(255,255,255,0.08);border-radius:8px;padding:10px 12px;font-family:monospace;font-size:clamp(11px,2.5vw,13px);min-height:60px;color:#8892b0">
+                    Waiting for send...
+                </div>
             </div>
         </div>
 
@@ -644,6 +694,148 @@ static esp_err_t root_get_handler(httpd_req_t* req)
             });
         }
 
+        function updatePeerSelect(){
+            fetch('/api/now/peers').then(function(r){return r.json()}).then(function(data){
+                var select=document.getElementById('msgTargetPeer');
+                var savedValue=select.value;
+                select.innerHTML='<option value="">-- Select Peer --</option>';
+                if(!data||data.length===0){
+                    return;
+                }
+                for(var i=0;i<data.length;i++){
+                    var p=data[i];
+                    var opt=document.createElement('option');
+                    opt.value=p.mac;
+                    opt.textContent=(p.name||'Unknown')+' ('+p.mac+')';
+                    select.appendChild(opt);
+                }
+                select.value=savedValue;
+            });
+        }
+
+        function stringToHex(str){
+            var hex='';
+            for(var i=0;i<str.length;i++){
+                hex+=str.charCodeAt(i).toString(16).padStart(2,'0');
+            }
+            return hex;
+        }
+
+        function hexToBytes(hex){
+            var bytes=[];
+            for(var i=0;i<hex.length;i+=2){
+                bytes.push(parseInt(hex.substr(i,2),16));
+            }
+            return bytes;
+        }
+
+        function sendEspnowMsg(){
+            var targetMac=document.getElementById('msgTargetPeer').value;
+            var msgData=document.getElementById('msgData').value.trim();
+            var msgType=document.querySelector('input[name="msgType"]:checked').value;
+            var resultEl=document.getElementById('msgResult');
+
+            if(!targetMac){
+                resultEl.innerHTML='<span style="color:#ff6666">Error: Please select a target peer</span>';
+                return;
+            }
+            if(!msgData){
+                resultEl.innerHTML='<span style="color:#ff6666">Error: Please enter message data</span>';
+                return;
+            }
+
+            var hexData;
+            if(msgType==='text'){
+                hexData=stringToHex(msgData);
+            }else{
+                hexData=msgData.replace(/\s/g,'');
+                if(!/^[0-9a-fA-F]*$/.test(hexData)||hexData.length%2!==0){
+                    resultEl.innerHTML='<span style="color:#ff6666">Error: Invalid hex format</span>';
+                    return;
+                }
+            }
+
+            var bytes=hexToBytes(hexData);
+            if(bytes.length>250){
+                resultEl.innerHTML='<span style="color:#ff6666">Error: Message too long (max 250 bytes)</span>';
+                return;
+            }
+
+            resultEl.innerHTML='<span style="color:#ffaa00">Sending to '+targetMac+'...</span>';
+            var btn=document.getElementById('sendMsgBtn');
+            btn.disabled=true;
+
+            fetch('/api/espnow/send',{
+                method:'POST',
+                headers:{'Content-Type':'application/json'},
+                body:JSON.stringify({mac:targetMac,data:hexData})
+            }).then(function(r){return r.json()}).then(function(d){
+                btn.disabled=false;
+                if(d.success){
+                    resultEl.innerHTML='<span style="color:#00ff88">Success! Sent to '+targetMac+'</span><br>'+
+                        '<span style="color:#8892b0;font-size:11px">Data: '+hexData+' ('+bytes.length+' bytes)</span>';
+                    showToast('Message sent successfully','success');
+                }else{
+                    resultEl.innerHTML='<span style="color:#ff6666">Failed: '+(d.message||'Unknown error')+'</span>';
+                    showToast('Send failed','error');
+                }
+            }).catch(function(err){
+                btn.disabled=false;
+                resultEl.innerHTML='<span style="color:#ff6666">Error: '+err.message+'</span>';
+            });
+        }
+
+        function broadcastEspnowMsg(){
+            var msgData=document.getElementById('msgData').value.trim();
+            var msgType=document.querySelector('input[name="msgType"]:checked').value;
+            var resultEl=document.getElementById('msgResult');
+
+            if(!msgData){
+                resultEl.innerHTML='<span style="color:#ff6666">Error: Please enter message data</span>';
+                return;
+            }
+
+            var hexData;
+            if(msgType==='text'){
+                hexData=stringToHex(msgData);
+            }else{
+                hexData=msgData.replace(/\s/g,'');
+                if(!/^[0-9a-fA-F]*$/.test(hexData)||hexData.length%2!==0){
+                    resultEl.innerHTML='<span style="color:#ff6666">Error: Invalid hex format</span>';
+                    return;
+                }
+            }
+
+            var bytes=hexToBytes(hexData);
+            if(bytes.length>250){
+                resultEl.innerHTML='<span style="color:#ff6666">Error: Message too long (max 250 bytes)</span>';
+                return;
+            }
+
+            resultEl.innerHTML='<span style="color:#00c8ff">Broadcasting to all peers...</span>';
+            var btn=document.getElementById('broadcastMsgBtn');
+            btn.disabled=true;
+
+            fetch('/api/espnow/broadcast',{
+                method:'POST',
+                headers:{'Content-Type':'application/json'},
+                body:JSON.stringify({data:hexData})
+            }).then(function(r){return r.json()}).then(function(d){
+                btn.disabled=false;
+                if(d.success){
+                    resultEl.innerHTML='<span style="color:#00ff88">Broadcast sent to all peers</span><br>'+
+                        '<span style="color:#8892b0;font-size:11px">Data: '+hexData+' ('+bytes.length+' bytes) | Sent: '+d.count+' peers</span>';
+                    showToast('Broadcast sent to '+d.count+' peers','success');
+                }else{
+                    resultEl.innerHTML='<span style="color:#ff6666">Failed: '+(d.message||'Unknown error')+'</span>';
+                    showToast('Broadcast failed','error');
+                }
+            }).catch(function(err){
+                btn.disabled=false;
+                resultEl.innerHTML='<span style="color:#ff6666">Error: '+err.message+'</span>';
+            });
+        }
+
         function updateUptime(){
             var s=Math.floor(Date.now()/1000)-startTime;
             var d=Math.floor(s/86400),h=Math.floor(s%86400/3600),m=Math.floor(s%3600/60),sec=s%60;
@@ -660,6 +852,8 @@ static esp_err_t root_get_handler(httpd_req_t* req)
         setInterval(updateBleStatus,2000);
         updateNowPeers();
         setInterval(updateNowPeers,3000);
+        updatePeerSelect();
+        setInterval(updatePeerSelect,3000);
         setInterval(updateUptime,1000);
     </script>
 </body>
@@ -1069,6 +1263,335 @@ static esp_err_t api_now_mac_handler(httpd_req_t* req)
     return ESP_OK;
 }
 
+static esp_err_t api_espnow_register_handler(httpd_req_t* req)
+{
+    ESP_LOGI(TAG, "=== ESP-NOW Register API called ===");
+
+    char buf[256] = {0};
+    int ret = httpd_req_recv(req, buf, sizeof(buf) - 1);
+    if (ret <= 0) {
+        ESP_LOGE(TAG, "Failed to receive register request data");
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Failed to receive data");
+        return ESP_FAIL;
+    }
+    buf[ret] = '\0';
+
+    ESP_LOGI(TAG, "Register request received: %s", buf);
+
+    uint8_t mac[6] = {0};
+    int channel = 1;
+    char name[32] = {0};
+
+    char* mac_str = strstr(buf, "\"mac\"");
+    if (mac_str) {
+        mac_str = strchr(mac_str, ':');
+        if (mac_str) {
+            mac_str++;
+            while (*mac_str && (*mac_str == ' ' || *mac_str == '\"')) mac_str++;
+            int vals[6];
+            if (sscanf(mac_str, "%x:%x:%x:%x:%x:%x",
+                       &vals[0], &vals[1], &vals[2],
+                       &vals[3], &vals[4], &vals[5]) == 6) {
+                for (int i = 0; i < 6; i++) mac[i] = (uint8_t)vals[i];
+            }
+        }
+    }
+
+    char* ch_str = strstr(buf, "\"channel\"");
+    if (ch_str) {
+        ch_str = strchr(ch_str, ':');
+        if (ch_str) {
+            ch_str++;
+            channel = atoi(ch_str);
+            if (channel < 1 || channel > 14) channel = 1;
+        }
+    }
+
+    char* name_str = strstr(buf, "\"name\"");
+    if (name_str) {
+        name_str = strchr(name_str, ':');
+        if (name_str) {
+            name_str++;
+            while (*name_str && (*name_str == ' ' || *name_str == '\"')) name_str++;
+            char* end = strchr(name_str, '"');
+            if (end) *end = '\0';
+            strncpy(name, name_str, sizeof(name) - 1);
+        }
+    }
+
+    bool ok = false;
+    if (mac[0] || mac[1] || mac[2] || mac[3] || mac[4] || mac[5]) {
+        ESP_LOGI(TAG, "WiFi AP client registering: " MACSTR " (ch=%d, name=%s)",
+                 MAC2STR(mac), channel, name);
+
+        if (wifi_now_is_initialized()) {
+            if (name[0]) {
+                ok = wifi_now_add_peer_with_name(mac, (uint8_t)channel, name);
+            } else {
+                ok = wifi_now_add_peer(mac, (uint8_t)channel);
+            }
+
+            if (ok) {
+                wifi_now_save_peers();
+                ESP_LOGI(TAG, "WiFi AP client added to peer list: " MACSTR,
+                         MAC2STR(mac));
+            } else {
+                ESP_LOGE(TAG, "Failed to add WiFi AP client to peer list: " MACSTR,
+                         MAC2STR(mac));
+            }
+        } else {
+            ESP_LOGE(TAG, "ESP-NOW not initialized, cannot add peer");
+        }
+    } else {
+        ESP_LOGE(TAG, "Invalid MAC address received in register request");
+    }
+
+    uint8_t ap_mac[6];
+    wifi_now_get_mac(ap_mac);
+    uint8_t ap_channel = wifi_now_get_channel();
+
+    snprintf(buf, sizeof(buf),
+             "{\"success\":%s,\"ap_mac\":\"" MACSTR "\",\"ap_channel\":%d}",
+             ok ? "true" : "false",
+             MAC2STR(ap_mac), ap_channel);
+
+    ESP_LOGI(TAG, "Sending response: %s", buf);
+
+    httpd_resp_set_type(req, "application/json");
+    int send_ret = httpd_resp_send(req, buf, strlen(buf));
+    if (send_ret == ESP_OK) {
+        ESP_LOGI(TAG, "Response sent successfully");
+    } else {
+        ESP_LOGE(TAG, "Failed to send response: %d", send_ret);
+    }
+    return ESP_OK;
+}
+
+static esp_err_t api_espnow_master_handler(httpd_req_t* req)
+{
+    uint8_t mac[6];
+    wifi_now_get_mac(mac);
+    char buf[128];
+    snprintf(buf, sizeof(buf),
+             "{\"mac\":\"" MACSTR "\",\"channel\":%d}",
+             MAC2STR(mac), wifi_now_get_channel());
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, buf, strlen(buf));
+    return ESP_OK;
+}
+
+static esp_err_t api_espnow_unpair_handler(httpd_req_t* req)
+{
+    char buf[512] = {0};
+    int ret = httpd_req_recv(req, buf, sizeof(buf) - 1);
+    if (ret <= 0) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Failed to receive data");
+        return ESP_FAIL;
+    }
+    buf[ret] = '\0';
+
+    uint8_t mac[6] = {0};
+
+    char* mac_str = strstr(buf, "\"mac\"");
+    if (mac_str) {
+        mac_str = strchr(mac_str, ':');
+        if (mac_str) {
+            mac_str++;
+            while (*mac_str && (*mac_str == ' ' || *mac_str == '"')) mac_str++;
+            int vals[6];
+            if (sscanf(mac_str, "%x:%x:%x:%x:%x:%x",
+                       &vals[0], &vals[1], &vals[2],
+                       &vals[3], &vals[4], &vals[5]) == 6) {
+                for (int i = 0; i < 6; i++) mac[i] = (uint8_t)vals[i];
+            }
+        }
+    }
+
+    bool ok = false;
+    if (mac[0] || mac[1] || mac[2] || mac[3] || mac[4] || mac[5]) {
+        ESP_LOGI(TAG, "WiFi AP unpair request for: " MACSTR, MAC2STR(mac));
+
+        if (wifi_now_is_peer_exists(mac)) {
+            ok = wifi_now_unpair_with_peer(mac);
+            if (ok) {
+                wifi_now_save_peers();
+                ESP_LOGI(TAG, "WiFi AP peer unpaired: " MACSTR, MAC2STR(mac));
+            }
+        } else {
+            ESP_LOGW(TAG, "Peer not found: " MACSTR, MAC2STR(mac));
+            ok = true;
+        }
+    }
+
+    snprintf(buf, sizeof(buf), "{\"success\":%s}", ok ? "true" : "false");
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, buf, strlen(buf));
+    return ESP_OK;
+}
+
+static int hex_decode(const char* hex, uint8_t* out, int max_len)
+{
+    int len = 0;
+    while (*hex && *(hex + 1) && len < max_len) {
+        char hi = *hex++;
+        char lo = *hex++;
+        int val;
+        if (hi >= '0' && hi <= '9') val = (hi - '0') << 4;
+        else if (hi >= 'a' && hi <= 'f') val = ((hi - 'a') + 10) << 4;
+        else if (hi >= 'A' && hi <= 'F') val = ((hi - 'A') + 10) << 4;
+        else continue;
+        if (lo >= '0' && lo <= '9') val |= (lo - '0');
+        else if (lo >= 'a' && lo <= 'f') val |= ((lo - 'a') + 10);
+        else if (lo >= 'A' && lo <= 'F') val |= ((lo - 'A') + 10);
+        else continue;
+        out[len++] = (uint8_t)val;
+    }
+    return len;
+}
+
+static esp_err_t api_espnow_send_handler(httpd_req_t* req)
+{
+    char buf[1024] = {0};
+    int ret = httpd_req_recv(req, buf, sizeof(buf) - 1);
+    if (ret <= 0) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Failed to receive data");
+        return ESP_FAIL;
+    }
+    buf[ret] = '\0';
+
+    uint8_t mac[6] = {0};
+    char* data = NULL;
+    int data_len = 0;
+
+    char* mac_str = strstr(buf, "\"mac\"");
+    if (mac_str) {
+        mac_str = strchr(mac_str, ':');
+        if (mac_str) {
+            mac_str++;
+            while (*mac_str && (*mac_str == ' ' || *mac_str == '"')) mac_str++;
+            int vals[6];
+            if (sscanf(mac_str, "%x:%x:%x:%x:%x:%x",
+                       &vals[0], &vals[1], &vals[2],
+                       &vals[3], &vals[4], &vals[5]) == 6) {
+                for (int i = 0; i < 6; i++) mac[i] = (uint8_t)vals[i];
+            }
+        }
+    }
+
+    char* data_str = strstr(buf, "\"data\"");
+    if (data_str) {
+        data_str = strchr(data_str, ':');
+        if (data_str) {
+            data_str++;
+            while (*data_str && (*data_str == ' ' || *data_str == '"')) data_str++;
+            char* end = strrchr(data_str, '"');
+            if (end) {
+                *end = '\0';
+                data = data_str;
+                data_len = strlen(data);
+                if (data_len > 500) data_len = 500;
+            }
+        }
+    }
+
+    uint8_t bin_buf[250];
+    int bin_len = 0;
+    if (data && data_len > 0) {
+        bin_len = hex_decode(data, bin_buf, sizeof(bin_buf));
+    }
+
+    bool ok = false;
+    int sent_len = 0;
+
+    if (mac[0] || mac[1] || mac[2] || mac[3] || mac[4] || mac[5]) {
+        if (bin_len > 0) {
+            ESP_LOGI(TAG, "Sending ESP-NOW data to " MACSTR " (len=%d)",
+                     MAC2STR(mac), bin_len);
+
+            sent_len = wifi_now_send(mac, bin_buf, bin_len);
+            if (sent_len == 0) {
+                ok = true;
+                ESP_LOGI(TAG, "ESP-NOW data sent successfully: %d bytes", bin_len);
+            } else {
+                ESP_LOGE(TAG, "Failed to send ESP-NOW data");
+            }
+        } else {
+            ESP_LOGE(TAG, "No data to send");
+        }
+    } else {
+        ESP_LOGE(TAG, "Invalid MAC address");
+    }
+
+    snprintf(buf, sizeof(buf),
+             "{\"success\":%s,\"sent\":%d}",
+             ok ? "true" : "false",
+             ok ? bin_len : 0);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, buf, strlen(buf));
+    return ESP_OK;
+}
+
+static esp_err_t api_espnow_broadcast_handler(httpd_req_t* req)
+{
+    char buf[1024] = {0};
+    int ret = httpd_req_recv(req, buf, sizeof(buf) - 1);
+    if (ret <= 0) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Failed to receive data");
+        return ESP_FAIL;
+    }
+    buf[ret] = '\0';
+
+    char* data = NULL;
+    int data_len = 0;
+
+    char* data_str = strstr(buf, "\"data\"");
+    if (data_str) {
+        data_str = strchr(data_str, ':');
+        if (data_str) {
+            data_str++;
+            while (*data_str && (*data_str == ' ' || *data_str == '"')) data_str++;
+            char* end = strrchr(data_str, '"');
+            if (end) {
+                *end = '\0';
+                data = data_str;
+                data_len = strlen(data);
+                if (data_len > 500) data_len = 500;
+            }
+        }
+    }
+
+    uint8_t bin_buf[250];
+    int bin_len = 0;
+    if (data && data_len > 0) {
+        bin_len = hex_decode(data, bin_buf, sizeof(bin_buf));
+    }
+
+    bool ok = false;
+    int sent_len = 0;
+
+    if (bin_len > 0) {
+        ESP_LOGI(TAG, "Broadcasting ESP-NOW data (len=%d)", bin_len);
+
+        sent_len = wifi_now_broadcast(bin_buf, bin_len);
+        if (sent_len == 0) {
+            ok = true;
+            ESP_LOGI(TAG, "ESP-NOW broadcast sent successfully: %d bytes", bin_len);
+        } else {
+            ESP_LOGE(TAG, "Failed to broadcast ESP-NOW data");
+        }
+    } else {
+        ESP_LOGE(TAG, "No data to broadcast");
+    }
+
+    snprintf(buf, sizeof(buf),
+             "{\"success\":%s,\"sent\":%d}",
+             ok ? "true" : "false",
+             ok ? bin_len : 0);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, buf, strlen(buf));
+    return ESP_OK;
+}
+
 } // extern "C"
 
 void web_server_start(WebServer* ws)
@@ -1095,6 +1618,11 @@ void web_server_start(WebServer* ws)
     httpd_uri_t now_peers_uri  = { .uri = "/api/now/peers", .method = HTTP_GET, .handler = api_now_peers_handler, .user_ctx = NULL };
     httpd_uri_t now_rm_uri     = { .uri = "/api/now/peer/remove", .method = HTTP_POST, .handler = api_now_peer_remove_handler, .user_ctx = NULL };
     httpd_uri_t now_mac_uri    = { .uri = "/api/now/mac", .method = HTTP_GET, .handler = api_now_mac_handler, .user_ctx = NULL };
+    httpd_uri_t espnow_reg_uri  = { .uri = "/api/espnow/register", .method = HTTP_POST, .handler = api_espnow_register_handler, .user_ctx = NULL };
+    httpd_uri_t espnow_master_uri = { .uri = "/api/espnow/master", .method = HTTP_GET, .handler = api_espnow_master_handler, .user_ctx = NULL };
+    httpd_uri_t espnow_unpair_uri = { .uri = "/api/espnow/unpair", .method = HTTP_POST, .handler = api_espnow_unpair_handler, .user_ctx = NULL };
+    httpd_uri_t espnow_send_uri = { .uri = "/api/espnow/send", .method = HTTP_POST, .handler = api_espnow_send_handler, .user_ctx = NULL };
+    httpd_uri_t espnow_broadcast_uri = { .uri = "/api/espnow/broadcast", .method = HTTP_POST, .handler = api_espnow_broadcast_handler, .user_ctx = NULL };
 
     if (httpd_start(&ws->server, &config) == ESP_OK) {
         httpd_register_uri_handler(ws->server, &root_uri);
@@ -1114,7 +1642,15 @@ void web_server_start(WebServer* ws)
         httpd_register_uri_handler(ws->server, &now_peers_uri);
         httpd_register_uri_handler(ws->server, &now_rm_uri);
         httpd_register_uri_handler(ws->server, &now_mac_uri);
+        httpd_register_uri_handler(ws->server, &espnow_reg_uri);
+        httpd_register_uri_handler(ws->server, &espnow_master_uri);
+        httpd_register_uri_handler(ws->server, &espnow_unpair_uri);
+        httpd_register_uri_handler(ws->server, &espnow_send_uri);
+        httpd_register_uri_handler(ws->server, &espnow_broadcast_uri);
         ESP_LOGI(TAG, "Web server started on port 80");
+
+        wifi_service_set_ap_client_callback(ap_client_connected_cb, NULL);
+        ESP_LOGI(TAG, "WiFi AP client callback registered");
     }
 }
 

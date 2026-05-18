@@ -61,10 +61,19 @@ static dhcp_client_info_t s_dhcp_clients[DHCP_CLIENT_MAX];
 static int                s_dhcp_client_count = 0;
 static SemaphoreHandle_t  s_dhcp_mutex = NULL;
 
+static wifi_ap_client_cb_t s_ap_client_cb = NULL;
+static void*               s_ap_client_cb_arg = NULL;
+
 static wifi_scan_item_t    s_scan_cache[WIFI_SCAN_MAX_RESULTS];
 static int                 s_scan_count = 0;
 static bool                s_scan_ready = false;
 static bool                s_scan_running = false;
+
+void wifi_service_set_ap_client_callback(wifi_ap_client_cb_t cb, void* user_data)
+{
+    s_ap_client_cb = cb;
+    s_ap_client_cb_arg = user_data;
+}
 
 static void collect_scan_results(void);
 
@@ -448,6 +457,20 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base,
             xSemaphoreGive(s_status_mutex);
             ESP_LOGI(TAG, "AP client connected: " MACSTR ", total: %d",
                      MAC2STR(event->mac), clients);
+
+            if (s_ap_client_cb) {
+                char client_ip[16] = "unknown";
+                xSemaphoreTake(s_dhcp_mutex, portMAX_DELAY);
+                for (int i = 0; i < s_dhcp_client_count; i++) {
+                    if (s_dhcp_clients[i].source == DHCP_CLIENT_SRC_AP &&
+                        memcmp(s_dhcp_clients[i].mac, event->mac, 6) == 0) {
+                        strncpy(client_ip, s_dhcp_clients[i].ip, sizeof(client_ip) - 1);
+                        break;
+                    }
+                }
+                xSemaphoreGive(s_dhcp_mutex);
+                s_ap_client_cb(event->mac, client_ip, s_ap_client_cb_arg);
+            }
             break;
         }
 

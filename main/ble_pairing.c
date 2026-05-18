@@ -16,18 +16,16 @@
 
 static const char* TAG = "BLE_PAIR";
 
-#define BLE_ADV_DURATION_MS     0
 #define BLE_MFG_ID              0x02E5
 #define BLE_TAG_MARKER_0        'E'
 #define BLE_TAG_MARKER_1        'N'
-#define BLE_MFG_DATA_MAX_LEN    40
 
-static ble_pair_state_t s_state               = BLE_PAIR_STATE_OFF;
 static SemaphoreHandle_t s_mutex              = NULL;
 static SemaphoreHandle_t s_scan_mutex         = NULL;
 
 static bool              s_advertising        = false;
 static bool              s_scanning           = false;
+static bool              s_auto_pair          = true;  // 自动配对开关
 static char              s_dev_name[BLE_DEV_NAME_MAX] = "ESP32-S3-NOW";
 static uint8_t           s_own_now_mac[6]     = {0};
 
@@ -36,31 +34,18 @@ static int                     s_discovered_count = 0;
 
 static TimerHandle_t s_scan_timer = NULL;
 
-typedef struct {
-    uint8_t type;
-    uint8_t len;
-    union {
-        uint8_t data[31];
-        struct {
-            uint16_t mfg_id;
-            uint8_t  payload[29];
-        } mfg;
-    };
-} ble_adv_data_raw_t;
-
 static uint8_t build_adv_raw(uint8_t* buf, uint8_t buf_size)
 {
     uint8_t pos = 0;
 
-    uint8_t flags_len = 3;
-    if (pos + flags_len <= buf_size) {
+    if (pos + 3 <= buf_size) {
         buf[pos++] = 2;
         buf[pos++] = 0x01;
         buf[pos++] = 0x06;
     }
 
     uint8_t name_len = (uint8_t)strlen(s_dev_name);
-    uint8_t name_max = (buf_size - pos - 2);
+    uint8_t name_max = buf_size - pos - 2;
     if (name_len > name_max) name_len = name_max;
 
     if (pos + 2 + name_len <= buf_size) {
@@ -70,8 +55,7 @@ static uint8_t build_adv_raw(uint8_t* buf, uint8_t buf_size)
         pos += name_len;
     }
 
-    uint8_t mfg_payload_len = 2 + 6 + 1 + (uint8_t)strlen(s_dev_name);
-    uint8_t mfg_total_len = mfg_payload_len;
+    uint8_t mfg_total_len = 10 + name_len;
     uint8_t mfg_max = buf_size - pos - 2;
     if (mfg_total_len > mfg_max) mfg_total_len = mfg_max;
 
@@ -84,8 +68,10 @@ static uint8_t build_adv_raw(uint8_t* buf, uint8_t buf_size)
         p[2] = BLE_TAG_MARKER_0;
         p[3] = BLE_TAG_MARKER_1;
         memcpy(p + 4, s_own_now_mac, 6);
-        p[10] = '\0';
-        strncpy((char*)(p + 10), s_dev_name, mfg_total_len - 10);
+        int copy_len = mfg_total_len - 10;
+        if (copy_len > 0) {
+            memcpy(p + 10, s_dev_name, copy_len);
+        }
         pos += mfg_total_len;
     }
 
@@ -132,44 +118,102 @@ static bool is_duplicate_mac(const uint8_t* mac)
     return false;
 }
 
+static bool is_duplicate_now_mac(const uint8_t* now_mac)
+{
+    for (int i = 0; i < s_discovered_count; i++) {
+        if (memcmp(s_discovered[i].now_mac, now_mac, 6) == 0) return true;
+    }
+    return false;
+}
+
 static void gap_event_handler(esp_gap_ble_cb_event_t event,
-                               esp_ble_gap_cb_param_t* param)
+                               esp_ble_gap_cb_param_t* params)
 {
     switch (event) {
-    case ESP_GAP_BLE_SCAN_RESULT_EVT: {
-        if (param->scan_rst.search_evt == ESP_GAP_SEARCH_INQ_RES_EVT) {
-            uint8_t now_mac[6];
-            char name[BLE_DEV_NAME_MAX] = {0};
-            if (parse_scan_mfg_data(param->scan_rst.ble_adv,
-                                     param->scan_rst.adv_data_len,
-                                     now_mac, name, sizeof(name))) {
-                xSemaphoreTake(s_scan_mutex, portMAX_DELAY);
-                if (!is_duplicate_mac(param->scan_rst.bda) &&
-                    s_discovered_count < BLE_MAX_DISCOVERED) {
-                    ble_discovered_device_t* dev = &s_discovered[s_discovered_count];
-                    memcpy(dev->mac, param->scan_rst.bda, 6);
-                    memcpy(dev->now_mac, now_mac, 6);
-                    strncpy(dev->name, name, sizeof(dev->name) - 1);
-                    dev->rssi = param->scan_rst.rssi;
-                    s_discovered_count++;
-                    ESP_LOGI(TAG, "Discovered: name=%s, NOW_MAC=" MACSTR
-                             ", BLE_MAC=" MACSTR ", rssi=%d",
-                             name, MAC2STR(now_mac),
-                             MAC2STR(param->scan_rst.bda), param->scan_rst.rssi);
+    case ESP_GAP_BLE_EXT_ADV_SET_PARAMS_COMPLETE_EVT:
+        if (params->ext_adv_set_params.status == ESP_BT_STATUS_SUCCESS) {
+            uint8_t raw[31];
+            uint8_t raw_len = build_adv_raw(raw, sizeof(raw));
+            esp_ble_gap_config_ext_adv_data_raw(0, raw_len, raw);
+        }
+        break;
+    case ESP_GAP_BLE_EXT_ADV_DATA_SET_COMPLETE_EVT:
+        if (params->ext_adv_data_set.status == ESP_BT_STATUS_SUCCESS) {
+            esp_ble_gap_ext_adv_t ext_adv = {};
+            ext_adv.instance = 0;
+            ext_adv.duration = 0;
+            ext_adv.max_events = 0;
+            esp_ble_gap_ext_adv_start(1, &ext_adv);
+        }
+        break;
+    case ESP_GAP_BLE_EXT_ADV_START_COMPLETE_EVT:
+        if (params->ext_adv_start.status == ESP_BT_STATUS_SUCCESS) {
+            s_advertising = true;
+            ESP_LOGI(TAG, "Advertising started: name=%s, NOW_MAC=" MACSTR,
+                     s_dev_name, MAC2STR(s_own_now_mac));
+        }
+        break;
+    case ESP_GAP_BLE_EXT_ADV_STOP_COMPLETE_EVT:
+        if (params->ext_adv_stop.status == ESP_BT_STATUS_SUCCESS) {
+            s_advertising = false;
+            ESP_LOGI(TAG, "Advertising stopped");
+        }
+        break;
+    case ESP_GAP_BLE_EXT_SCAN_START_COMPLETE_EVT:
+        if (params->ext_scan_start.status == ESP_BT_STATUS_SUCCESS) {
+            s_scanning = true;
+            ESP_LOGI(TAG, "Scan started");
+        }
+        break;
+    case ESP_GAP_BLE_SCAN_STOP_COMPLETE_EVT:
+        if (params->scan_stop_cmpl.status == ESP_BT_STATUS_SUCCESS) {
+            s_scanning = false;
+            ESP_LOGI(TAG, "Scan stopped, discovered=%d", s_discovered_count);
+        }
+        break;
+    case ESP_GAP_BLE_EXT_ADV_REPORT_EVT: {
+        const esp_ble_gap_ext_adv_report_t* report = &params->ext_adv_report.params;
+        uint8_t now_mac[6];
+        char name[BLE_DEV_NAME_MAX] = {0};
+        if (parse_scan_mfg_data(report->adv_data, report->adv_data_len, now_mac, name, sizeof(name))) {
+            bool already_discovered = is_duplicate_now_mac(now_mac);
+            bool already_paired = wifi_now_is_peer_exists(now_mac);
+            
+            // 自动添加到ESP-NOW peer并发送配对请求（如果没有重复）
+            if (s_auto_pair && !already_paired) {
+                uint8_t channel = wifi_now_get_channel();
+                bool added = wifi_now_add_peer(now_mac, channel);
+                if (added) {
+                    ESP_LOGI(TAG, "Auto-paired with %s (" MACSTR "), ch=%d",
+                             name, MAC2STR(now_mac), channel);
+                    wifi_now_save_peers();
+                    
+                    // 发送配对请求给对方，让对方也添加我们为peer
+                    wifi_now_send_pair_request(now_mac);
                 }
-                xSemaphoreGive(s_scan_mutex);
+            } else if (already_paired && !already_discovered) {
+                // 已经配对过但不是刚刚发现的，发送配对请求更新信息
+                wifi_now_send_pair_request(now_mac);
             }
+            
+            xSemaphoreTake(s_scan_mutex, portMAX_DELAY);
+            if (!is_duplicate_mac(report->addr) && s_discovered_count < BLE_MAX_DISCOVERED) {
+                ble_discovered_device_t* dev = &s_discovered[s_discovered_count];
+                memcpy(dev->mac, report->addr, 6);
+                memcpy(dev->now_mac, now_mac, 6);
+                strncpy(dev->name, name, sizeof(dev->name) - 1);
+                dev->rssi = report->rssi;
+                s_discovered_count++;
+                ESP_LOGI(TAG, "Discovered: name=%s, NOW_MAC=" MACSTR
+                         ", BLE_MAC=" MACSTR ", rssi=%d, paired=%s",
+                         name, MAC2STR(now_mac),
+                         MAC2STR(report->addr), report->rssi,
+                         already_paired ? "yes" : "no");
+            }
+            xSemaphoreGive(s_scan_mutex);
         }
         break;
     }
-    case ESP_GAP_BLE_SCAN_STOP_COMPLETE_EVT:
-        s_scanning = false;
-        ESP_LOGI(TAG, "Scan stopped, discovered=%d", s_discovered_count);
-        break;
-    case ESP_GAP_BLE_ADV_STOP_COMPLETE_EVT:
-        s_advertising = false;
-        ESP_LOGI(TAG, "Advertising stopped");
-        break;
     default:
         break;
     }
@@ -205,28 +249,24 @@ void ble_pairing_init(void)
     ret = esp_bt_controller_init(&bt_cfg);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "BT controller init failed: %d", ret);
-        s_state = BLE_PAIR_STATE_ERROR;
         return;
     }
 
     ret = esp_bt_controller_enable(ESP_BT_MODE_BLE);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "BT controller enable failed: %d", ret);
-        s_state = BLE_PAIR_STATE_ERROR;
         return;
     }
 
     ret = esp_bluedroid_init();
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Bluedroid init failed: %d", ret);
-        s_state = BLE_PAIR_STATE_ERROR;
         return;
     }
 
     ret = esp_bluedroid_enable();
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Bluedroid enable failed: %d", ret);
-        s_state = BLE_PAIR_STATE_ERROR;
         return;
     }
 
@@ -244,7 +284,6 @@ void ble_pairing_init(void)
         nvs_close(handle);
     }
 
-    s_state = BLE_PAIR_STATE_OFF;
     ESP_LOGI(TAG, "BLE pairing initialized, dev_name=%s", s_dev_name);
 }
 
@@ -266,31 +305,17 @@ void ble_pairing_deinit(void)
     esp_bluedroid_deinit();
     esp_bt_controller_disable();
     esp_bt_controller_deinit();
-
-    s_state = BLE_PAIR_STATE_OFF;
 }
 
 ble_pair_state_t ble_pairing_get_state(void)
 {
-    return s_state;
+    if (s_advertising) return BLE_PAIR_STATE_ADVERTISING;
+    if (s_scanning) return BLE_PAIR_STATE_SCANNING;
+    return BLE_PAIR_STATE_OFF;
 }
 
 bool ble_pairing_start_advertise(const char* device_name)
 {
-    if (s_state == BLE_PAIR_STATE_ERROR) {
-        ESP_LOGE(TAG, "BLE not initialized properly");
-        return false;
-    }
-
-    if (s_advertising) {
-        ESP_LOGW(TAG, "Already advertising");
-        return true;
-    }
-
-    if (s_scanning) {
-        ble_pairing_stop_scan();
-    }
-
     if (device_name && device_name[0]) {
         strncpy(s_dev_name, device_name, sizeof(s_dev_name) - 1);
         nvs_handle_t handle;
@@ -301,42 +326,31 @@ bool ble_pairing_start_advertise(const char* device_name)
         }
     }
 
-    uint8_t raw[31];
-    uint8_t raw_len = build_adv_raw(raw, sizeof(raw));
+    esp_ble_gap_ext_adv_params_t ext_adv_params = {};
+    ext_adv_params.type = ESP_BLE_GAP_SET_EXT_ADV_PROP_LEGACY_IND;
+    ext_adv_params.interval_min = 160;
+    ext_adv_params.interval_max = 160;
+    ext_adv_params.channel_map = ADV_CHNL_ALL;
+    ext_adv_params.own_addr_type = BLE_ADDR_TYPE_PUBLIC;
+    ext_adv_params.primary_phy = ESP_BLE_GAP_PHY_1M;
+    ext_adv_params.secondary_phy = ESP_BLE_GAP_PHY_1M;
+    ext_adv_params.scan_req_notif = false;
 
-    esp_err_t ret = esp_ble_gap_config_adv_data_raw(raw, raw_len);
+    esp_err_t ret = esp_ble_gap_ext_adv_set_params(0, &ext_adv_params);
     if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Config adv data failed: %d", ret);
+        ESP_LOGE(TAG, "Set adv params failed: %d", ret);
         return false;
     }
 
-    esp_ble_adv_params_t adv_params = {};
-    adv_params.adv_int_min        = 0x100;
-    adv_params.adv_int_max        = 0x160;
-    adv_params.adv_type           = ADV_TYPE_IND;
-    adv_params.own_addr_type      = BLE_ADDR_TYPE_PUBLIC;
-    adv_params.channel_map        = ADV_CHNL_ALL;
-    adv_params.adv_filter_policy  = ADV_FILTER_ALLOW_SCAN_ANY_CON_ANY;
-
-    ret = esp_ble_gap_start_advertising(&adv_params);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Start advertising failed: %d", ret);
-        return false;
-    }
-
-    s_advertising = true;
-    s_state = BLE_PAIR_STATE_ADVERTISING;
-    ESP_LOGI(TAG, "Advertising started: name=%s, NOW_MAC=" MACSTR,
-             s_dev_name, MAC2STR(s_own_now_mac));
     return true;
 }
 
 void ble_pairing_stop_advertise(void)
 {
     if (!s_advertising) return;
-    esp_ble_gap_stop_advertising();
+    uint8_t instance = 0;
+    esp_ble_gap_ext_adv_stop(1, (const uint8_t*)&instance);
     s_advertising = false;
-    s_state = BLE_PAIR_STATE_OFF;
     ESP_LOGI(TAG, "Advertising stopped");
 }
 
@@ -347,47 +361,35 @@ bool ble_pairing_is_advertising(void)
 
 bool ble_pairing_start_scan(uint8_t duration_sec)
 {
-    if (s_state == BLE_PAIR_STATE_ERROR) {
-        ESP_LOGE(TAG, "BLE not initialized properly");
-        return false;
-    }
-
-    if (s_scanning) {
-        ESP_LOGW(TAG, "Already scanning");
-        return true;
-    }
-
-    if (s_advertising) {
-        ble_pairing_stop_advertise();
-    }
-
     xSemaphoreTake(s_scan_mutex, portMAX_DELAY);
     s_discovered_count = 0;
     memset(s_discovered, 0, sizeof(s_discovered));
     xSemaphoreGive(s_scan_mutex);
 
-    esp_ble_scan_params_t scan_params = {};
-    scan_params.scan_type          = BLE_SCAN_TYPE_ACTIVE;
-    scan_params.own_addr_type      = BLE_ADDR_TYPE_PUBLIC;
-    scan_params.scan_filter_policy = BLE_SCAN_FILTER_ALLOW_ALL;
-    scan_params.scan_interval      = 0x50;
-    scan_params.scan_window        = 0x30;
-    scan_params.scan_duplicate     = BLE_SCAN_DUPLICATE_DISABLE;
+    esp_ble_ext_scan_params_t ext_scan_params = {};
+    ext_scan_params.own_addr_type = BLE_ADDR_TYPE_PUBLIC;
+    ext_scan_params.filter_policy = BLE_SCAN_FILTER_ALLOW_ALL;
+    ext_scan_params.scan_duplicate = BLE_SCAN_DUPLICATE_DISABLE;
+    ext_scan_params.cfg_mask = ESP_BLE_GAP_EXT_SCAN_CFG_UNCODE_MASK;
+    ext_scan_params.uncoded_cfg.scan_type = BLE_SCAN_TYPE_ACTIVE;
+    ext_scan_params.uncoded_cfg.scan_interval = 80;
+    ext_scan_params.uncoded_cfg.scan_window = 48;
+    ext_scan_params.coded_cfg.scan_type = BLE_SCAN_TYPE_ACTIVE;
+    ext_scan_params.coded_cfg.scan_interval = 80;
+    ext_scan_params.coded_cfg.scan_window = 48;
 
-    esp_err_t ret = esp_ble_gap_set_scan_params(&scan_params);
+    esp_err_t ret = esp_ble_gap_set_ext_scan_params(&ext_scan_params);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Set scan params failed: %d", ret);
         return false;
     }
 
-    ret = esp_ble_gap_start_scanning(duration_sec);
+    uint32_t duration_ms = duration_sec * 1000;
+    ret = esp_ble_gap_start_ext_scan(duration_ms, 0);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Start scan failed: %d", ret);
         return false;
     }
-
-    s_scanning = true;
-    s_state = BLE_PAIR_STATE_SCANNING;
 
     if (s_scan_timer) {
         xTimerDelete(s_scan_timer, 0);
@@ -413,7 +415,7 @@ void ble_pairing_stop_scan(void)
         s_scan_timer = NULL;
     }
 
-    esp_ble_gap_stop_scanning();
+    esp_ble_gap_stop_ext_scan();
     s_scanning = false;
     ESP_LOGI(TAG, "Scan stopped");
 }
@@ -455,11 +457,30 @@ bool ble_pairing_pair_with_device(int index)
     if (ok) {
         ESP_LOGI(TAG, "Paired with %s, NOW_MAC=" MACSTR,
                  name, MAC2STR(now_mac));
+        wifi_now_save_peers();
     }
     return ok;
+}
+
+void ble_pairing_set_auto_pair(bool enable)
+{
+    s_auto_pair = enable;
+    ESP_LOGI(TAG, "Auto-pair: %s", enable ? "enabled" : "disabled");
+}
+
+bool ble_pairing_get_auto_pair(void)
+{
+    return s_auto_pair;
 }
 
 uint8_t* ble_pairing_get_own_now_mac(void)
 {
     return s_own_now_mac;
+}
+
+void ble_pairing_get_name(char* name_out)
+{
+    if (!name_out) return;
+    strncpy(name_out, s_dev_name, BLE_DEV_NAME_MAX - 1);
+    name_out[BLE_DEV_NAME_MAX - 1] = '\0';
 }

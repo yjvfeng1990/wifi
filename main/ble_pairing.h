@@ -41,7 +41,12 @@ bool ble_pairing_is_scanning(void);
 int  ble_pairing_get_discovered(ble_discovered_device_t* devices, int max_count);
 bool ble_pairing_pair_with_device(int index);
 
+void ble_pairing_set_auto_pair(bool enable);
+bool ble_pairing_get_auto_pair(void);
+
 uint8_t* ble_pairing_get_own_now_mac(void);
+
+void ble_pairing_get_name(char* name_out);
 
 #ifdef __cplusplus
 }

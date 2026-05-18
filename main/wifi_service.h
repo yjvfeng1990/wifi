@@ -62,6 +62,10 @@ typedef struct {
     uint32_t usb_up_bps;
 } WiFiStatus;
 
+typedef void (*wifi_ap_client_cb_t)(const uint8_t* client_mac, const char* client_ip, void* user_data);
+
+void wifi_service_set_ap_client_callback(wifi_ap_client_cb_t cb, void* user_data);
+
 void wifi_service_init(void);
 void wifi_service_connect(const char* ssid, const char* password);
 void wifi_service_disconnect(void);
