@@ -376,7 +376,7 @@ void wifi_now_get_peers_json(char* buffer, size_t buffer_size)
         char mac_str[18];
         snprintf(mac_str, sizeof(mac_str), MACSTR, MAC2STR(s_peer_cache[i].mac));
         pos += snprintf(buffer + pos, buffer_size - pos,
-                        "%s{\"mac\":\"%s\",\"channel\":%d,\"name\":\"%s\"}",
+                        "%s{\"mac\":\"%s\",\"channel\":%d,\"name\":\"%s\",\"type\":\"slave\"}",
                         i > 0 ? "," : "",
                         mac_str,
                         s_peer_cache[i].channel,

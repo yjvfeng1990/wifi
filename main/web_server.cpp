@@ -278,9 +278,15 @@ static esp_err_t root_get_handler(httpd_req_t* req)
 
         <div class="card">
             <h2><span class="dot dot-offline" id="bleDot"></span> BLE Pairing</h2>
-            <div style="margin-bottom:12px">
-                <div class="status-label" style="margin-bottom:4px">ESP-NOW MAC</div>
-                <div class="mac-box" id="nowMac">--</div>
+            <div style="margin-bottom:12px;display:flex;gap:12px;flex-wrap:wrap">
+                <div>
+                    <div class="status-label" style="margin-bottom:4px">ESP-NOW MAC</div>
+                    <div class="mac-box" id="nowMac">--</div>
+                </div>
+                <div>
+                    <div class="status-label" style="margin-bottom:4px">Channel</div>
+                    <div class="mac-box" id="nowChannel" style="min-width:48px;text-align:center">--</div>
+                </div>
             </div>
             <div style="display:flex;gap:8px;align-items:flex-end;flex-wrap:wrap;margin-bottom:12px">
                 <div class="form-group" style="flex:1;min-width:120px;margin-bottom:0">
@@ -590,6 +596,14 @@ static esp_err_t root_get_handler(httpd_req_t* req)
             });
         }
 
+        function updateEspnowMaster(){
+            fetch('/api/espnow/master').then(function(r){return r.json()}).then(function(d){
+                if(d.channel){
+                    document.getElementById('nowChannel').textContent=d.channel;
+                }
+            }).catch(function(){});
+        }
+
         function updateBleStatus(){
             fetch('/api/ble/status').then(function(r){return r.json()}).then(function(d){
                 var btn=document.getElementById('bleAdvBtn');
@@ -676,10 +690,11 @@ static esp_err_t root_get_handler(httpd_req_t* req)
                     container.innerHTML='<div class="dhcp-empty">No peers paired</div>';
                     return;
                 }
-                var html='<table class="dhcp-table"><thead><tr><th>Name</th><th>ESP-NOW MAC</th><th>Channel</th><th></th></tr></thead><tbody>';
+                var html='<table class="dhcp-table"><thead><tr><th>Name</th><th>MAC Address</th><th>Channel</th><th>Type</th><th>Action</th></tr></thead><tbody>';
                 for(var i=0;i<data.length;i++){
                     var p=data[i];
-                    html+='<tr><td>'+p.name+'</td><td>'+p.mac+'</td><td>'+p.channel+'</td>';
+                    var peerType=p.type||'WiFi';
+                    html+='<tr><td>'+p.name+'</td><td>'+p.mac+'</td><td>'+p.channel+'</td><td>'+peerType+'</td>';
                     html+='<td><button class="btn-mini" onclick="removePeer(\''+p.mac+'\')">Remove</button></td></tr>';
                 }
                 html+='</tbody></table>';
@@ -848,6 +863,8 @@ static esp_err_t root_get_handler(httpd_req_t* req)
         updateDhcpClients();
         setInterval(updateDhcpClients,5000);
         updateNowMac();
+        updateEspnowMaster();
+        setInterval(updateEspnowMaster,5000);
         updateBleStatus();
         setInterval(updateBleStatus,2000);
         updateNowPeers();
@@ -1202,6 +1219,52 @@ static esp_err_t api_ble_devices_handler(httpd_req_t* req)
     return ESP_OK;
 }
 
+static int url_decode(const char* src, char* dst, int max_len)
+{
+    int len = 0;
+    while (*src && len < max_len - 1) {
+        if (*src == '%' && *(src + 1) && *(src + 2)) {
+            char hi = *(src + 1);
+            char lo = *(src + 2);
+            int val;
+            if (hi >= '0' && hi <= '9') val = (hi - '0') << 4;
+            else if (hi >= 'a' && hi <= 'f') val = ((hi - 'a') + 10) << 4;
+            else if (hi >= 'A' && hi <= 'F') val = ((hi - 'A') + 10) << 4;
+            else { dst[len++] = *src++; continue; }
+            if (lo >= '0' && lo <= '9') val |= (lo - '0');
+            else if (lo >= 'a' && lo <= 'f') val |= ((lo - 'a') + 10);
+            else if (lo >= 'A' && lo <= 'F') val |= ((lo - 'A') + 10);
+            else { dst[len++] = *src++; continue; }
+            dst[len++] = (char)val;
+            src += 3;
+        } else {
+            dst[len++] = *src++;
+        }
+    }
+    dst[len] = '\0';
+    return len;
+}
+
+static int hex_decode(const char* hex, uint8_t* out, int max_len)
+{
+    int len = 0;
+    while (*hex && *(hex + 1) && len < max_len) {
+        char hi = *hex++;
+        char lo = *hex++;
+        int val;
+        if (hi >= '0' && hi <= '9') val = (hi - '0') << 4;
+        else if (hi >= 'a' && hi <= 'f') val = ((hi - 'a') + 10) << 4;
+        else if (hi >= 'A' && hi <= 'F') val = ((hi - 'A') + 10) << 4;
+        else continue;
+        if (lo >= '0' && lo <= '9') val |= (lo - '0');
+        else if (lo >= 'a' && lo <= 'f') val |= ((lo - 'a') + 10);
+        else if (lo >= 'A' && lo <= 'F') val |= ((lo - 'A') + 10);
+        else continue;
+        out[len++] = (uint8_t)val;
+    }
+    return len;
+}
+
 static esp_err_t api_ble_pair_handler(httpd_req_t* req)
 {
     char buf[64] = {0};
@@ -1237,13 +1300,18 @@ static esp_err_t api_now_peer_remove_handler(httpd_req_t* req)
         char* mac_str = strstr(buf, "mac=");
         if (mac_str) {
             mac_str += 4;
+            char decoded_mac[64];
+            url_decode(mac_str, decoded_mac, sizeof(decoded_mac));
             uint8_t mac[6];
             int vals[6];
-            if (sscanf(mac_str, "%x:%x:%x:%x:%x:%x",
+            if (sscanf(decoded_mac, "%x:%x:%x:%x:%x:%x",
                        &vals[0], &vals[1], &vals[2],
                        &vals[3], &vals[4], &vals[5]) == 6) {
                 for (int i = 0; i < 6; i++) mac[i] = (uint8_t)vals[i];
                 wifi_now_remove_peer(mac);
+                ESP_LOGI(TAG, "Removed peer: " MACSTR, MAC2STR(mac));
+            } else {
+                ESP_LOGE(TAG, "Failed to parse MAC: %s (decoded: %s)", mac_str, decoded_mac);
             }
         }
     }
@@ -1427,26 +1495,6 @@ static esp_err_t api_espnow_unpair_handler(httpd_req_t* req)
     httpd_resp_set_type(req, "application/json");
     httpd_resp_send(req, buf, strlen(buf));
     return ESP_OK;
-}
-
-static int hex_decode(const char* hex, uint8_t* out, int max_len)
-{
-    int len = 0;
-    while (*hex && *(hex + 1) && len < max_len) {
-        char hi = *hex++;
-        char lo = *hex++;
-        int val;
-        if (hi >= '0' && hi <= '9') val = (hi - '0') << 4;
-        else if (hi >= 'a' && hi <= 'f') val = ((hi - 'a') + 10) << 4;
-        else if (hi >= 'A' && hi <= 'F') val = ((hi - 'A') + 10) << 4;
-        else continue;
-        if (lo >= '0' && lo <= '9') val |= (lo - '0');
-        else if (lo >= 'a' && lo <= 'f') val |= ((lo - 'a') + 10);
-        else if (lo >= 'A' && lo <= 'F') val |= ((lo - 'A') + 10);
-        else continue;
-        out[len++] = (uint8_t)val;
-    }
-    return len;
 }
 
 static esp_err_t api_espnow_send_handler(httpd_req_t* req)
