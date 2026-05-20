@@ -99,6 +99,7 @@ bool wifi_now_is_peer_exists(const uint8_t* mac_addr);
 void wifi_now_clear_peers(void);
 
 int  wifi_now_get_peer_list(wifi_now_peer_info_t* peers, int max_count);
+int  wifi_now_format_peer_entry(int idx, char* buffer, size_t buffer_size, bool add_comma);
 void wifi_now_get_peers_json(char* buffer, size_t buffer_size);
 
 void wifi_now_save_peers(void);
@@ -120,6 +121,7 @@ bool wifi_now_update_msg_template(int index, const char* name, const uint8_t* da
 bool wifi_now_remove_msg_template(int index);
 int  wifi_now_get_msg_template_count(void);
 bool wifi_now_get_msg_template(int index, wifi_now_msg_template_t* template_out);
+int  wifi_now_format_msg_template(int idx, char* buffer, size_t buffer_size, bool add_comma);
 void wifi_now_get_msg_templates_json(char* buffer, size_t buffer_size);
 void wifi_now_save_msg_templates(void);
 void wifi_now_load_msg_templates(void);
@@ -137,11 +139,15 @@ void wifi_now_set_unpair_callback(wifi_now_unpair_cb_t cb);
 // 接收消息历史
 bool wifi_now_add_recv_entry(const uint8_t* mac, const uint8_t* data, int len);
 int  wifi_now_get_recv_count(void);
+int  wifi_now_get_recv_start(void);
+int  wifi_now_format_recv_entry(int idx, char* buffer, size_t buffer_size, bool add_comma);
 void wifi_now_get_recv_messages_json(char* buffer, size_t buffer_size);
 
 // 发送消息历史
 bool wifi_now_add_send_entry(const uint8_t* mac, int len, bool success, bool is_broadcast);
 int  wifi_now_get_send_history_count(void);
+int  wifi_now_get_send_history_start(void);
+int  wifi_now_format_send_entry(int idx, char* buffer, size_t buffer_size, bool add_comma);
 void wifi_now_get_send_history_json(char* buffer, size_t buffer_size);
 
 #ifdef __cplusplus

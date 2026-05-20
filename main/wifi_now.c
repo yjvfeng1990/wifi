@@ -1062,6 +1062,24 @@ void wifi_now_get_msg_templates_json(char* buffer, size_t buffer_size)
     snprintf(buffer + pos, buffer_size - pos, "]");
 }
 
+int wifi_now_format_msg_template(int idx, char* buffer, size_t buffer_size, bool add_comma)
+{
+    if (!buffer || buffer_size < 10 || idx < 0 || idx >= s_msg_cache_count) return 0;
+
+    char data_hex[ESP_NOW_MSG_DATA_MAX * 2 + 1] = {0};
+    for (int j = 0; j < s_msg_cache[idx].data_len; j++) {
+        snprintf(&data_hex[j * 2], sizeof(data_hex) - j * 2, "%02x", s_msg_cache[idx].data[j]);
+    }
+
+    return snprintf(buffer, buffer_size,
+                    "%s{\"index\":%d,\"name\":\"%s\",\"data\":\"%s\",\"data_len\":%d}",
+                    add_comma ? "," : "",
+                    idx,
+                    s_msg_cache[idx].name,
+                    data_hex,
+                    s_msg_cache[idx].data_len);
+}
+
 void wifi_now_save_msg_templates(void)
 {
     nvs_handle_t handle;
@@ -1216,6 +1234,51 @@ void wifi_now_get_recv_messages_json(char* buffer, size_t buffer_size)
     snprintf(buffer + pos, buffer_size - pos, "]");
 }
 
+int wifi_now_get_recv_start(void)
+{
+    return s_recv_ring_count < ESP_NOW_RECV_HISTORY_MAX ? 0 : s_recv_ring_head;
+}
+
+int wifi_now_format_recv_entry(int idx, char* buffer, size_t buffer_size, bool add_comma)
+{
+    if (!buffer || buffer_size < 10 || idx < 0 || idx >= ESP_NOW_RECV_HISTORY_MAX) return 0;
+    if (s_recv_ring_count == 0) return 0;
+
+    wifi_now_recv_entry_t* entry = &s_recv_ring[idx];
+    if (entry->data_len <= 0) return 0;
+
+    char mac_str[18];
+    snprintf(mac_str, sizeof(mac_str), MACSTR, MAC2STR(entry->mac));
+
+    char data_buf[1024];
+    int dp = 0;
+
+    if (is_text_content(entry->data, entry->data_len)) {
+        for (int j = 0; j < entry->data_len && dp < (int)sizeof(data_buf) - 10; j++) {
+            uint8_t b = entry->data[j];
+            if (b == '"' || b == '\\') { data_buf[dp++] = '\\'; data_buf[dp++] = (char)b; }
+            else if (b == '\n') { data_buf[dp++] = '\\'; data_buf[dp++] = 'n'; }
+            else if (b == '\r') { data_buf[dp++] = '\\'; data_buf[dp++] = 'r'; }
+            else if (b == '\t') { data_buf[dp++] = '\\'; data_buf[dp++] = 't'; }
+            else if (b < 0x20) {
+                dp += snprintf(&data_buf[dp], sizeof(data_buf) - dp, "\\u%04x", b);
+            } else {
+                data_buf[dp++] = (char)b;
+            }
+        }
+    } else {
+        for (int j = 0; j < entry->data_len && dp < (int)sizeof(data_buf) - 4; j++) {
+            if (j > 0) data_buf[dp++] = ' ';
+            dp += snprintf(&data_buf[dp], sizeof(data_buf) - dp, "%02X", entry->data[j]);
+        }
+    }
+    data_buf[dp] = '\0';
+
+    return snprintf(buffer, buffer_size,
+                    "%s{\"mac\":\"%s\",\"len\":%d,\"data\":\"%s\"}",
+                    add_comma ? "," : "", mac_str, entry->data_len, data_buf);
+}
+
 // ========== 发送历史环形缓冲 ==========
 
 bool wifi_now_add_send_entry(const uint8_t* mac, int len, bool success, bool is_broadcast)
@@ -1268,4 +1331,45 @@ void wifi_now_get_send_history_json(char* buffer, size_t buffer_size)
                         entry->acked ? "true" : "false");
     }
     snprintf(buffer + pos, buffer_size - pos, "]");
+}
+
+int wifi_now_get_send_history_start(void)
+{
+    return s_send_history_count < ESP_NOW_SEND_HISTORY_MAX ? 0 : s_send_history_head;
+}
+
+int wifi_now_format_send_entry(int idx, char* buffer, size_t buffer_size, bool add_comma)
+{
+    if (!buffer || buffer_size < 10 || idx < 0 || idx >= ESP_NOW_SEND_HISTORY_MAX) return 0;
+    if (s_send_history_count == 0) return 0;
+
+    wifi_now_send_entry_t* entry = &s_send_history[idx];
+    char mac_str[18];
+    snprintf(mac_str, sizeof(mac_str), MACSTR, MAC2STR(entry->mac));
+
+    return snprintf(buffer, buffer_size,
+                    "%s{\"mac\":\"%s\",\"len\":%d,\"success\":%s,\"broadcast\":%s,\"acked\":%s}",
+                    add_comma ? "," : "",
+                    mac_str,
+                    entry->data_len,
+                    entry->success ? "true" : "false",
+                    entry->is_broadcast ? "true" : "false",
+                    entry->acked ? "true" : "false");
+}
+
+int wifi_now_format_peer_entry(int idx, char* buffer, size_t buffer_size, bool add_comma)
+{
+    if (!buffer || buffer_size < 10 || idx < 0 || idx >= s_peer_cache_count) return 0;
+
+    char mac_str[18];
+    const char* type_str = (s_peer_cache[idx].peer_type == PEER_TYPE_WIFI) ? "WiFi" : "ESP-NOW";
+    snprintf(mac_str, sizeof(mac_str), MACSTR, MAC2STR(s_peer_cache[idx].mac));
+
+    return snprintf(buffer, buffer_size,
+                    "%s{\"mac\":\"%s\",\"channel\":%d,\"name\":\"%s\",\"type\":\"%s\"}",
+                    add_comma ? "," : "",
+                    mac_str,
+                    s_peer_cache[idx].channel,
+                    s_peer_cache[idx].name,
+                    type_str);
 }

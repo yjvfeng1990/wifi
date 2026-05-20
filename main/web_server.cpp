@@ -754,11 +754,11 @@ static esp_err_t root_get_handler(httpd_req_t* req)
         }
         
         function hexToStr(hex){
-            var str='';
+            var bytes=[];
             for(var i=0;i<hex.length;i+=2){
-                str+=String.fromCharCode(parseInt(hex.substr(i,2),16));
+                bytes.push(parseInt(hex.substr(i,2),16));
             }
-            return str;
+            return new TextDecoder().decode(new Uint8Array(bytes));
         }
         
         function isValidHex(s){
@@ -1864,10 +1864,20 @@ static esp_err_t api_ble_pair_handler(httpd_req_t* req)
 
 static esp_err_t api_now_peers_handler(httpd_req_t* req)
 {
-    char buffer[2048];
-    wifi_now_get_peers_json(buffer, sizeof(buffer));
     httpd_resp_set_type(req, "application/json; charset=utf-8");
-    httpd_resp_send(req, buffer, strlen(buffer));
+    httpd_resp_send_chunk(req, "[", 1);
+
+    int total = wifi_now_get_peer_count();
+    char chunk[512];
+    for (int i = 0; i < total; i++) {
+        int len = wifi_now_format_peer_entry(i, chunk, sizeof(chunk), i > 0);
+        if (len > 0) {
+            if (httpd_resp_send_chunk(req, chunk, len) != ESP_OK) break;
+        }
+    }
+
+    httpd_resp_send_chunk(req, "]", 1);
+    httpd_resp_send_chunk(req, NULL, 0);
     return ESP_OK;
 }
 
@@ -2270,10 +2280,20 @@ static esp_err_t api_espnow_broadcast_handler(httpd_req_t* req)
 
 static esp_err_t api_espnow_templates_get_handler(httpd_req_t* req)
 {
-    char buffer[4096];
-    wifi_now_get_msg_templates_json(buffer, sizeof(buffer));
     httpd_resp_set_type(req, "application/json; charset=utf-8");
-    httpd_resp_send(req, buffer, strlen(buffer));
+    httpd_resp_send_chunk(req, "[", 1);
+
+    int total = wifi_now_get_msg_template_count();
+    char chunk[1280];
+    for (int i = 0; i < total; i++) {
+        int len = wifi_now_format_msg_template(i, chunk, sizeof(chunk), i > 0);
+        if (len > 0) {
+            if (httpd_resp_send_chunk(req, chunk, len) != ESP_OK) break;
+        }
+    }
+
+    httpd_resp_send_chunk(req, "]", 1);
+    httpd_resp_send_chunk(req, NULL, 0);
     return ESP_OK;
 }
 
@@ -2601,29 +2621,47 @@ static esp_err_t api_espnow_send_templates_handler(httpd_req_t* req)
 
 static esp_err_t api_espnow_messages_handler(httpd_req_t* req)
 {
-    char* buf = (char*)malloc(4096);
-    if (!buf) {
-        httpd_resp_send_500(req);
-        return ESP_FAIL;
-    }
-    wifi_now_get_recv_messages_json(buf, 4096);
     httpd_resp_set_type(req, "application/json; charset=utf-8");
-    httpd_resp_send(req, buf, strlen(buf));
-    free(buf);
+
+    // 发送 JSON 起始
+    httpd_resp_send_chunk(req, "[", 1);
+
+    int total = wifi_now_get_recv_count();
+    int start = wifi_now_get_recv_start();
+
+    char chunk[1280]; // 足以容纳单条消息（最大 ~750 字符 hex + ~50 字符 JSON 外壳）
+    for (int i = 0; i < total; i++) {
+        int idx = (start + i) % ESP_NOW_RECV_HISTORY_MAX;
+        int len = wifi_now_format_recv_entry(idx, chunk, sizeof(chunk), i > 0);
+        if (len > 0) {
+            if (httpd_resp_send_chunk(req, chunk, len) != ESP_OK) break;
+        }
+    }
+
+    // 发送 JSON 结束并终止分片
+    httpd_resp_send_chunk(req, "]", 1);
+    httpd_resp_send_chunk(req, NULL, 0);
     return ESP_OK;
 }
 
 static esp_err_t api_espnow_send_history_handler(httpd_req_t* req)
 {
-    char* buf = (char*)malloc(2048);
-    if (!buf) {
-        httpd_resp_send_500(req);
-        return ESP_FAIL;
-    }
-    wifi_now_get_send_history_json(buf, 2048);
     httpd_resp_set_type(req, "application/json; charset=utf-8");
-    httpd_resp_send(req, buf, strlen(buf));
-    free(buf);
+    httpd_resp_send_chunk(req, "[", 1);
+
+    int total = wifi_now_get_send_history_count();
+    int start = wifi_now_get_send_history_start();
+    char chunk[512];
+    for (int i = 0; i < total; i++) {
+        int idx = (start + i) % ESP_NOW_SEND_HISTORY_MAX;
+        int len = wifi_now_format_send_entry(idx, chunk, sizeof(chunk), i > 0);
+        if (len > 0) {
+            if (httpd_resp_send_chunk(req, chunk, len) != ESP_OK) break;
+        }
+    }
+
+    httpd_resp_send_chunk(req, "]", 1);
+    httpd_resp_send_chunk(req, NULL, 0);
     return ESP_OK;
 }
 
