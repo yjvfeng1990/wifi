@@ -4,8 +4,8 @@
 
 本文档描述了通过WiFi HTTP API实现ESP-NOW节点自动发现和组网的方法。节点设备通过连接ESP32-S3的AP（热点），使用HTTP请求交换ESP-NOW MAC地址，实现无缝组网。
 
-**文档版本**: 5.0  
-**更新日期**: 2026-05-18  
+**文档版本**: 6.0  
+**更新日期**: 2026-05-20  
 **适用平台**: ESP-IDF v6.0.1 / ESP32-S3
 
 ---
@@ -18,9 +18,11 @@
 4. [组网流程](#3-组网流程)
 5. [API详细说明](#4-api详细说明)
 6. [消息发送与接收协议](#5-消息发送与接收协议)
-7. [实现示例](#6-实现示例)
-8. [错误处理](#7-错误处理)
-9. [其他平台开发指南](#8-其他平台开发指南)
+7. [ACK确认协议](#6-ack确认协议)
+8. [消息模板与Web界面](#7-消息模板与web界面)
+9. [实现示例](#8-实现示例)
+10. [错误处理](#9-错误处理)
+11. [其他平台开发指南](#10-其他平台开发指南)
 
 ---
 
@@ -151,6 +153,12 @@ ESP-NOW是一种高效的点对点WiFi通信协议，但传统的ESP-NOW配对�
 | GET | `/api/now/mac` | 获取本机ESP-NOW MAC (BLE) |
 | GET | `/api/now/peers` | 获取已连接的ESP-NOW节点列表 |
 | POST | `/api/now/peer/remove` | 移除指定的ESP-NOW节点 |
+
+### 新增功能 (v6.0)
+
+- **应用层ACK确认** - 接收方自动回复ACK确认消息，发送方可追踪消息是否被对端应用层接收
+- **ACK状态追踪** - 发送历史记录增加 `acked` 字段，Web界面以标签形式显示
+- **消息模板Text/JSON/HEX三种模式** - Web界面新增 JSON 类型，含语法校验和自动格式化
 
 ### 新增功能 (v5.0)
 
@@ -799,33 +807,245 @@ void espnow_init_receiver(void) {
 | 7 | **ESP-NOW 已初始化** | `esp_now_init()` 返回 ESP_OK | 检查返回值 |
 | 8 | **数据长度** | ≤ 250 字节 | 检查 `data_len` 参数 |
 
-### 5.6 发送端确认 (ACK)
+---
 
-ESP-NOW 底层在 WiFi MAC 层有 ACK 机制。当 `esp_now_send_cb` 返回 `ESP_NOW_SEND_SUCCESS` 表示 MAC 层 ACK 已收到，即对方**物理层已确认接收**。但应用层是否处理取决于对端是否注册了 recv_cb。
+## 6. ACK确认协议
 
-若要应用层确认，需要实现**应用层回执**：
+### 6.1 概述
+
+本系统实现了**应用层ACK确认**。当接收方通过 ESP-NOW 收到非广播数据时，自动回复一个 ACK 确认消息。发送方收到 ACK 后，将对应的发送记录标记为已确认，可在 Web 界面或 API 中查看 ACK 状态。
 
 ```
-发送方                                接收方
-  │  esp_now_send(data)               │
-  │ ─────────────────────────────────►│
-  │                                    │
-  │                    MAC层 ACK       │
-  │ ◄─────────────────────────────────│
-  │  send_cb: SUCCESS                 │
-  │                                    │  recv_cb(data)
-  │                   应用层回执       │
-  │ ◄──────── esp_now_send("ACK") ────│
-  │  recv_cb: 收到 "ACK"              │
-  │                                    │
-  ✓ 发送成功确认                       ✓
+发送方 (主机)                          接收方 (节点)
+    │                                       │
+    │  esp_now_send(data)                   │
+    │  ───────────────────────────────────► │
+    │                                       │  recv_cb(data) 触发
+    │                                       │  自动回复 ACK
+    │                  MAC层 ACK            │
+    │  ◄─────────────────────────────────── │
+    │  send_cb: SUCCESS                     │
+    │                                       │
+    │                  应用层ACK            │
+    │  ◄──────── ACK (type=0x05) ───────────│
+    │  recv_cb: 收到 ACK                    │
+    │  标记 acked = true                    │
+    │                                       │
+    ✓ 发送 + 应用层确认完成                  ✓
 ```
+
+### 6.2 ACK消息格式
+
+ACK 消息复用 `esp_now_pair_msg_t` 结构体，与配对/解绑消息相同：
+
+```c
+#pragma pack(push, 1)
+typedef struct {
+    uint32_t magic;        // 0x4553504E ("ESPN")
+    uint8_t  type;         // 0x05 = ESP_NOW_MSG_ACK
+    uint8_t  mac[6];       // 发送者的 ESP-NOW MAC
+    char     name[32];     // 设备名称
+} esp_now_pair_msg_t;
+#pragma pack(pop)
+```
+
+**消息类型定义**（完整列表）：
+
+| 类型值 | 常量名 | 说明 |
+|--------|--------|------|
+| `0x01` | `ESP_NOW_MSG_PAIR_REQUEST` | 配对请求 |
+| `0x02` | `ESP_NOW_MSG_PAIR_RESPONSE` | 配对响应 |
+| `0x03` | `ESP_NOW_MSG_UNPAIR_REQUEST` | 解绑请求 |
+| `0x04` | `ESP_NOW_MSG_UNPAIR_RESPONSE` | 解绑响应 |
+| `0x05` | `ESP_NOW_MSG_ACK` | **ACK确认** |
+
+### 6.3 ACK触发条件
+
+接收方自动回复 ACK 需满足以下**所有**条件：
+
+1. **非广播数据** — 接收到的数据不是发送到广播地址 `FF:FF:FF:FF:FF:FF`
+2. **是已配对的 peer** — 发送方在接收方的 peer 列表中
+3. **不是控制消息** — 接收到的数据不是配对/解绑/ACK 本身（即不回复 ACK 的 ACK）
+
+> ⚠️ **广播消息不会触发 ACK**。广播发送方不应等待 ACK。
+
+### 6.4 ACK匹配机制
+
+发送方收到 ACK 后，根据以下规则匹配发送记录：
+
+1. 遍历发送历史（按时间倒序）
+2. 查找第一条匹配的记录：`发送目标MAC == ACK来源MAC` 且 `发送状态成功` 且 `尚未被确认`
+3. 匹配成功后标记 `acked = true`
+
+```c
+// 匹配逻辑伪代码
+for (entry : send_history) {
+    if (entry.mac == ack_src_mac && entry.success && !entry.acked) {
+        entry.acked = true;
+        break;
+    }
+}
+```
+
+### 6.5 发送历史中的ACK状态
+
+发送历史记录增加了 `acked` 字段：
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| mac | `uint8_t[6]` | 目标MAC地址 |
+| data_len | `uint8_t` | 发送的数据长度 |
+| success | `bool` | 底层发送是否成功（MAC层ACK） |
+| is_broadcast | `bool` | 是否为广播 |
+| **acked** | **`bool`** | **是否收到应用层ACK确认** |
+
+Web 界面中的显示：
+
+- 单播成功 + 已确认 → 绿色标签 `ACK✓`
+- 单播成功 + 等待中 → 黄色标签 `ACK...`
+- 广播消息 → 不显示 ACK 标签
+
+### 6.6 对端实现要求
+
+要实现双端 ACK 确认，**对端设备必须**：
+
+1. **识别 ACK 消息** — 在 `recv_cb` 中检测 `esp_now_pair_msg_t` 的 `magic == "ESPN"` 且 `type == 0x05`
+2. **回复 ACK** — 收到非广播数据后，回复 ACK 消息给对方
+3. **注意中断上下文** — ESP8266 等平台不能在 recv_cb 中直接发送，需使用延迟机制
+
+#### ESP8266 延迟 ACK 示例
+
+```cpp
+// 全局变量
+static uint8_t g_pendingAckMac[6];
+static bool g_hasPendingAck = false;
+
+// 在 recv_cb 中设置延迟 ACK
+void onDataReceived(uint8_t* mac, uint8_t* data, uint8_t len) {
+    // ... 处理数据 ...
+    
+    // 设置延迟 ACK
+    memcpy(g_pendingAckMac, mac, 6);
+    g_hasPendingAck = true;
+}
+
+// 在 loop 中发送 ACK
+void processPendingAck() {
+    if (g_hasPendingAck && !g_sendBusy) {
+        g_hasPendingAck = false;
+        sendAckMsg(g_pendingAckMac);
+    }
+}
+```
+
+### 6.7 ACK性能说明
+
+- ACK 消息大小固定为 43 字节（`esp_now_pair_msg_t`）
+- ACK 不会触发 ACK 的 ACK（不会无限循环）
+- ACK 发送走同一 ESP-NOW 通道，不会额外占用 WiFi 带宽
+- 发送方收到 ACK 通常在 1-5ms 内（取决于底层 WiFi 调度）
 
 ---
 
-## 6. 实现示例
+## 7. 消息模板与Web界面
 
-### 6.1 ESP32 节点实现 (v2.0)
+### 7.1 模板管理
+
+系统支持通过 Web 界面管理消息模板，模板数据以 hex 格式持久化存储在 NVS 中。
+
+**模板结构**：
+
+```c
+typedef struct {
+    char name[MSG_TEMPLATE_NAME_MAX];     // 模板名称 (24字节)
+    uint8_t data[MSG_TEMPLATE_DATA_MAX];  // 模板数据 (80字节，hex格式)
+    uint8_t data_len;                     // 数据长度
+} MsgTemplate;
+```
+
+**API接口**：
+
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| GET | `/api/espnow/templates` | 获取所有消息模板 (JSON) |
+| POST | `/api/espnow/templates/update` | 创建/更新消息模板 |
+
+**GET /api/espnow/templates 响应**：
+```json
+[
+  {
+    "name": "开灯",
+    "data": "aabbccdd",
+    "data_len": 4
+  }
+]
+```
+
+**POST /api/espnow/templates/update 请求**：
+```json
+{
+  "index": 0,
+  "name": "开灯",
+  "data": "aabbccdd"
+}
+```
+
+> `index` 为模板索引（0-based），最大数量为 `MSG_TEMPLATE_MAX`。`data` 字段始终为 hex 编码字符串。
+
+### 7.2 Message Type 自动转换
+
+Web 界面的 Message Type 提供三种模式：**Text**、**JSON**、**HEX**。切换时输入框内容自动转换：
+
+| 操作 | 转换规则 | 示例 |
+|------|---------|------|
+| Text → HEX | 每个字符转 hex | `"AB"` → `"4142"` |
+| HEX → Text | hex 解码为文本 | `"4142"` → `"AB"` |
+| 无效hex → Text | 保持原内容 | `"xyz"` → `"xyz"` |
+| HEX → JSON | hex→text解码，合法JSON自动格式化 | `"7b2261223a31627d"` → `{\n  "a": 1\n}` |
+| JSON → HEX | `stringToHex()` 转 hex | `{"a":1}` → `"7b2261223a317d"` |
+
+**各模式行为对比**：
+
+| 特性 | Text | JSON | Hex |
+|------|------|------|-----|
+| 校验规则 | 无 | `JSON.parse()` 语法校验 | 正则 `/^[0-9a-fA-F]*$/` |
+| 保存/发送 | `stringToHex()` 转 hex | 先校验 JSON，通过后 `stringToHex()` | 原样 hex 字符串 |
+| 格式化显示 | 无 | `JSON.stringify(..., null, 2)` 缩进 | 无 |
+| 非法输入 | 正常保存 | toast 提示 `Invalid JSON`，拒绝保存 | 静默跳过 |
+
+服务器始终以 hex 格式存储数据。Web 界面在 Text 或 JSON 模式下加载模板时自动进行 `hex → text` 解码显示。
+
+### 7.3 发送历史与ACK显示
+
+**GET /api/espnow/send/history 响应**：
+```json
+[
+  {
+    "mac": "aa:bb:cc:dd:ee:ff",
+    "data_len": 5,
+    "success": true,
+    "is_broadcast": false,
+    "acked": true
+  }
+]
+```
+
+`acked` 字段说明：
+- `true` — 已收到对端的应用层 ACK 确认
+- `false` — 单播成功但尚未收到 ACK（可能对端不支持 ACK 协议）
+- 广播消息的 `acked` 始终为 `false`
+
+### 7.4 发送模式标签
+
+Web 界面在发送区域显示当前模式标签：
+- **Unicast: MAC地址** — 蓝色标签，显示选中的目标 MAC
+- **Broadcast** — 紫色标签，表示当前为广播模式
+
+---
+
+## 8. 实现示例
+
+### 8.1 ESP32 节点实现 (v2.0)
 
 ```cpp
 #include <WiFi.h>
@@ -974,7 +1194,7 @@ void loop() {
 }
 ```
 
-### 6.2 ESP8266 节点实现
+### 8.2 ESP8266 节点实现
 
 ```cpp
 #include <ESP8266WiFi.h>
@@ -1084,7 +1304,7 @@ void loop() {
 }
 ```
 
-### 6.3 Python 实现（树莓派/PC）
+### 8.3 Python 实现（树莓派/PC）
 
 ```python
 import requests
@@ -1145,7 +1365,7 @@ if __name__ == "__main__":
     main()
 ```
 
-### 6.4 JavaScript/Node.js 实现
+### 8.4 JavaScript/Node.js 实现
 
 ```javascript
 const http = require('http');
@@ -1202,9 +1422,9 @@ main().catch(console.error);
 
 ---
 
-## 7. 错误处理
+## 9. 错误处理
 
-### 7.1 常见错误及解决方案
+### 9.1 常见错误及解决方案
 
 | # | 错误现象 | 原因 | 解决方案 |
 |---|---------|------|----------|
@@ -1220,8 +1440,11 @@ main().catch(console.error);
 | 10 | 发送返回 success:false | MAC地址无效或数据为空 | 检查请求中的 MAC 和 data 字段 |
 | 11 | 发送返回 success:false | ESP-NOW 未初始化 | 调用 `/api/espnow/master` 确认 ESP-NOW 状态 |
 | 12 | 对端收到乱码 | 数据格式理解错误 | 对端收到的是原始二进制字节，非 hex 字符串 |
+| 13 | 发送成功但 **ACK状态始终为false** | 对端不支持ACK协议 | 仅在双方都实现ACK协议时，`acked` 才会为 `true` |
+| 14 | 发送成功但ACK状态false | 对端未识别ACK消息 | 对端 `recv_cb` 需正确解析 `esp_now_pair_msg_t` 的 `magic` 和 `type` |
+| 15 | 单播发送成功但收不到ACK | 消息被当作广播发送 | 对端仅对非广播（目标MAC不是 `FF:FF:FF:FF:FF:FF`）回复ACK |
 
-### 7.2 调试流程
+### 9.2 调试流程
 
 ```
 发送失败排查:
@@ -1239,7 +1462,7 @@ main().catch(console.error);
       └─ 6. 数据长度 ≤ 250 字节 ?
 ```
 
-### 7.3 重试机制
+### 9.3 重试机制
 
 ```cpp
 bool registerWithRetry(int maxRetries = 3) {
@@ -1269,16 +1492,16 @@ bool registerWithRetry(int maxRetries = 3) {
 
 ---
 
-## 8. 其他平台开发指南
+## 10. 其他平台开发指南
 
-### 8.1 通用要求
+### 10.1 通用要求
 
 1. **WiFi STA模式** - 设备需要支持WiFi客户端模式
 2. **HTTP Client** - 支持HTTP GET/POST请求
 3. **JSON解析** - 能够解析和构建JSON数据
 4. **ESP-NOW支持** - 设备需要支持ESP-NOW协议（仅ESP系列）
 
-### 8.2 平台兼容性
+### 10.2 平台兼容性
 
 | 平台 | WiFi | HTTP | JSON | ESP-NOW |
 |------|------|------|------|----------|
@@ -1289,7 +1512,7 @@ bool registerWithRetry(int maxRetries = 3) {
 | 手机APP | ✅ | ✅ | ✅ | ❌ |
 | 其他MCU | ✅ | ✅ | ✅ | ❌ |
 
-### 8.3 非ESP设备注意事项
+### 10.3 非ESP设备注意事项
 
 对于非ESP系列设备（如树莓派、PC等），由于不支持ESP-NOW协议，可以通过以下方式使用此API：
 
@@ -1297,7 +1520,7 @@ bool registerWithRetry(int maxRetries = 3) {
 2. **间接通信** - 通过HTTP API中转ESP-NOW数据
 3. **监控和管理** - 查看设备状态、管理节点
 
-### 8.4 重要提示
+### 10.4 重要提示
 
 - **设置 PMK** — 对端 ESP-NOW 初始化后必须调用 `esp_now_set_pmk((const uint8_t*)"pmk1234567890123")`
 - **使用响应中的 channel** — POST /register 响应中的 `ap_channel` 字段是主机实际使用的 channel
@@ -1308,21 +1531,21 @@ bool registerWithRetry(int maxRetries = 3) {
 
 ---
 
-## 9. 最佳实践
+## 11. 最佳实践
 
-### 9.1 安全性
+### 11.1 安全性
 
 - ⚠️ **AP密码保护** - 生产环境中应设置AP密码
 - ⚠️ **API认证** - 可添加token验证防止未授权注册
 - ⚠️ **数据加密** - 敏感数据应加密传输
 
-### 9.2 性能优化
+### 11.2 性能优化
 
 - 📊 **批量注册** - 支持批量注册多个节点
 - 🔄 **自动重连** - 实现WiFi和ESP-NOW的自动重连
 - 📝 **日志记录** - 记录组网过程便于调试
 
-### 9.3 可靠性
+### 11.3 可靠性
 
 - ✅ **超时处理** - 所有网络操作设置超时
 - ✅ **错误恢复** - 失败后自动重试
@@ -1330,9 +1553,9 @@ bool registerWithRetry(int maxRetries = 3) {
 
 ---
 
-## 10. API测试
+## 12. API测试
 
-### 10.1 使用curl测试
+### 12.1 使用curl测试
 
 ```bash
 # 获取主机信息
@@ -1362,7 +1585,7 @@ curl -X POST http://192.168.4.1/api/espnow/unpair \
   -d '{"mac":"AA:BB:CC:DD:EE:FF"}'
 ```
 
-### 10.2 浏览器测试
+### 12.2 浏览器测试
 
 直接在浏览器中访问：
 - `http://192.168.4.1/api/espnow/master`
@@ -1378,13 +1601,11 @@ curl -X POST http://192.168.4.1/api/espnow/unpair \
 | 2.0 | 2026-05-18 | System | 更新注册响应格式，添加AP客户端回调机制 |
 | 3.0 | 2026-05-18 | System | 添加退网解绑功能 |
 | 4.0 | 2026-05-18 | System | 添加ESP-NOW消息发送和广播功能 |
+| 5.0 | 2026-05-18 | System | 关键约定、消息协议、排查清单、数据格式对照表 |
+| **6.0** | **2026-05-20** | **System** | **应用层ACK确认协议、消息模板Web管理、Text/HEX自动转换、ACK状态追踪** |
 
 ---
 
-**文档版本**: 4.0
-
----
-
-**文档版本**: 3.0  
-**更新日期**: 2026-05-18  
+**文档版本**: 6.0  
+**更新日期**: 2026-05-20  
 **适用平台**: ESP-IDF v6.0.1 / ESP32-S3

@@ -2,6 +2,10 @@
 #include <string.h>
 #include "esp_log.h"
 #include "esp_system.h"
+#include "esp_heap_caps.h"
+#include "esp_flash.h"
+#include "esp_partition.h"
+#include "esp_chip_info.h"
 #include "esp_timer.h"
 #include "esp_wifi.h"
 #include "esp_mac.h"
@@ -11,6 +15,7 @@
 #include "wifi_service.h"
 #include "ble_pairing.h"
 #include "wifi_now.h"
+#include "role_control.h"
 
 static const char* TAG = "WEB_SRV";
 
@@ -124,16 +129,25 @@ static esp_err_t root_get_handler(httpd_req_t* req)
         .scan-item-info{flex:1;min-width:0}
         .scan-item-ssid{font-weight:500;font-size:clamp(12px,2.5vw,14px);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
         .scan-item-meta{font-size:clamp(9px,2vw,11px);color:#8892b0;margin-top:1px}
-        .ble-toggle-btn{display:inline-flex;align-items:center;gap:8px;padding:clamp(8px,2vw,12px) clamp(14px,3vw,20px);border:none;border-radius:clamp(6px,1.5vw,8px);font-size:clamp(11px,2.5vw,13px);font-weight:600;cursor:pointer;transition:all 0.3s;text-transform:uppercase;letter-spacing:0.5px}
-        .ble-toggle-on{background:linear-gradient(135deg,#00ff88,#00cc6a);color:#111}
-        .ble-toggle-off{background:rgba(255,68,68,0.2);color:#ff6666;border:1px solid rgba(255,68,68,0.3)}
-        .ble-toggle-on:hover{box-shadow:0 4px 16px rgba(0,255,136,0.3)}
-        .ble-toggle-off:hover{background:rgba(255,68,68,0.3)}
         .mac-box{background:rgba(0,200,255,0.1);border:1px solid rgba(0,200,255,0.2);padding:clamp(6px,1.5vw,10px) clamp(10px,3vw,15px);border-radius:clamp(6px,1.5vw,8px);font-family:monospace;font-size:clamp(12px,2.5vw,14px);color:#00c8ff;word-break:break-all}
-        .btn-pair{background:rgba(0,200,255,0.15);color:#00c8ff;border:1px solid rgba(0,200,255,0.3);padding:clamp(4px,1.5vw,6px) clamp(10px,3vw,14px);border-radius:clamp(4px,1vw,6px);font-size:clamp(10px,2vw,12px);font-weight:600;cursor:pointer;transition:all 0.2s;white-space:nowrap}
-        .btn-pair:hover{background:rgba(0,200,255,0.25)}
-        .btn-mini{background:rgba(255,68,68,0.15);color:#ff6666;border:none;padding:2px 8px;border-radius:4px;font-size:10px;cursor:pointer}
-        .btn-mini:hover{background:rgba(255,68,68,0.3)}
+        .msg-row{display:flex;gap:8px;align-items:flex-start;padding:6px 8px;background:rgba(0,0,0,0.15);border:1px solid rgba(255,255,255,0.06);border-radius:6px;transition:background 0.2s}
+        .msg-row:hover{background:rgba(0,0,0,0.25)}
+        .msg-row input[type="text"]{padding:8px 10px;background:rgba(0,0,0,0.2);border:1px solid rgba(255,255,255,0.1);border-radius:6px;color:#c8d3f5;font-size:13px;transition:all 0.2s;min-height:36px;line-height:20px}
+        .msg-row input[type="text"]:focus{outline:none;border-color:#e94560;box-shadow:0 0 0 2px rgba(233,69,96,0.1)}
+        .msg-row input[type="text"]::placeholder{color:rgba(136,146,176,0.4)}
+        .msg-row .msg-name{width:80px;flex-shrink:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+        .msg-row .msg-data{flex:1;min-width:120px;font-family:monospace;word-break:break-all;white-space:normal;overflow-wrap:anywhere}
+        .msg-row .msg-checkbox{width:18px;height:18px;flex-shrink:0;accent-color:#e94560;cursor:pointer;margin-top:9px}
+        .msg-toolbar{display:flex;gap:8px;align-items:center;margin-bottom:12px;flex-wrap:wrap}
+        .msg-toolbar .btn{height:36px;padding:0 20px;font-size:13px;display:inline-flex;align-items:center;justify-content:center;margin-top:0}
+        .msg-toolbar .form-group{align-items:center;margin-bottom:0}
+        .msg-toolbar input[type="number"]{height:36px;padding:6px 8px;font-size:13px;background:rgba(0,0,0,0.2);border:1px solid rgba(255,255,255,0.1);border-radius:6px;color:#c8d3f5;box-sizing:border-box}
+        .msg-toolbar label{margin-bottom:0}
+        .msg-header{display:flex;gap:8px;align-items:center;padding:0 8px;margin-bottom:6px}
+        .msg-header>div{font-weight:600;color:#8892b0;font-size:12px;text-transform:uppercase;letter-spacing:0.5px}
+        .msg-header .h-check{width:18px;flex-shrink:0}
+        .msg-header .h-name{width:80px;flex-shrink:0}
+        .msg-header .h-data{flex:1;min-width:120px}
         .rssi-small{font-size:clamp(9px,2vw,11px);color:#8892b0}
         @media(min-width:640px){
             .thr-grid{grid-template-columns:repeat(auto-fit,minmax(200px,1fr))}
@@ -277,8 +291,8 @@ static esp_err_t root_get_handler(httpd_req_t* req)
         </div>
 
         <div class="card">
-            <h2><span class="dot dot-offline" id="bleDot"></span> BLE Pairing</h2>
-            <div style="margin-bottom:12px;display:flex;gap:12px;flex-wrap:wrap">
+            <h2>Role Control</h2>
+            <div style="margin-bottom:12px;display:flex;gap:12px;flex-wrap:wrap;align-items:flex-end">
                 <div>
                     <div class="status-label" style="margin-bottom:4px">ESP-NOW MAC</div>
                     <div class="mac-box" id="nowMac">--</div>
@@ -287,24 +301,40 @@ static esp_err_t root_get_handler(httpd_req_t* req)
                     <div class="status-label" style="margin-bottom:4px">Channel</div>
                     <div class="mac-box" id="nowChannel" style="min-width:48px;text-align:center">--</div>
                 </div>
-            </div>
-            <div style="display:flex;gap:8px;align-items:flex-end;flex-wrap:wrap;margin-bottom:12px">
                 <div class="form-group" style="flex:1;min-width:120px;margin-bottom:0">
-                    <label for="bleName">Device Name</label>
-                    <input type="text" id="bleName" placeholder="ESP32-S3-NOW" style="font-size:clamp(12px,2.5vw,14px)">
-                </div>
-                <div>
-                    <button class="ble-toggle-btn ble-toggle-off" id="bleAdvBtn" onclick="toggleAdvertise()">Start BLE</button>
+                    <label for="bleName" style="margin-bottom:4px">Device Name</label>
+                    <input type="text" id="bleName" placeholder="ESP32-S3-NOW" onblur="saveDeviceName()" style="font-size:clamp(12px,2.5vw,14px);width:100%;padding:6px 10px;background:rgba(0,0,0,0.2);border:1px solid rgba(255,255,255,0.1);border-radius:6px;color:#c8d3f5;outline:none">
                 </div>
             </div>
-            <div style="display:flex;gap:8px;align-items:center;margin-bottom:8px">
-                <button class="scan-btn" id="bleScanBtn" onclick="startBleScan()">Scan BLE Devices</button>
-                <span class="scan-spinner" id="bleScanSpinner" style="display:none"></span>
-                <span style="font-size:12px;color:#8892b0" id="bleScanStatus"></span>
+            <div class="status-grid">
+                <div class="status-item">
+                    <div class="status-label">Role Mode</div>
+                    <select id="roleSelect" onchange="changeRole()" style="width:100%;padding:8px 10px;background:rgba(0,0,0,0.2);border:1px solid rgba(255,255,255,0.1);border-radius:6px;color:#c8d3f5;font-size:13px;outline:none;cursor:pointer">
+                        <option value="0">Off</option>
+                        <option value="1">Broadcast (Slave)</option>
+                        <option value="2">Receive (Master)</option>
+                    </select>
+                </div>
+                <div class="status-item">
+                    <div class="status-label">State</div>
+                    <div id="roleState" style="font-size:15px;font-weight:600;color:#8892b0">IDLE</div>
+                </div>
+                <div class="status-item">
+                    <div class="status-label">Remaining</div>
+                    <div id="roleRemaining" style="font-size:15px;font-weight:600;color:#8892b0">--</div>
+                </div>
+                <div class="status-item">
+                    <div class="status-label">Peers</div>
+                    <div id="rolePeers" style="font-size:15px;font-weight:600;color:#8892b0">0</div>
+                </div>
             </div>
-            <div class="scan-list" id="bleDevList" style="max-height:200px">
-                <div class="dhcp-empty">No devices discovered</div>
+            <div style="display:flex;gap:8px;margin-top:12px">
+                <button class="btn btn-primary" id="roleStartBtn" onclick="startRole()">Start</button>
+                <button class="btn btn-outline" id="roleStopBtn" onclick="stopRole()">Stop</button>
             </div>
+            <p style="color:#8892b0;font-size:12px;margin-top:8px">
+                GPIO4: pull to GND to trigger start &bull; Auto-stops after 30s
+            </p>
         </div>
 
         <div class="card">
@@ -318,29 +348,55 @@ static esp_err_t root_get_handler(httpd_req_t* req)
             <h2>ESP-NOW Message Tool</h2>
             <div style="margin-bottom:16px">
                 <div class="status-label" style="margin-bottom:6px">Select Target Peer</div>
-                <select id="msgTargetPeer">
-                    <option value="">-- Select Peer --</option>
-                </select>
+                <div style="display:flex;gap:8px;align-items:center">
+                    <select id="msgTargetPeer" onchange="updateSendModeLabel()" style="flex:1">
+                        <option value="">-- Select Peer --</option>
+                    </select>
+                    <span id="sendModeLabel" style="display:none;padding:3px 10px;border-radius:12px;font-size:11px;font-weight:600;white-space:nowrap"></span>
+                </div>
             </div>
             <div style="margin-bottom:16px">
                 <div class="status-label" style="margin-bottom:6px">Message Type</div>
                 <div style="display:flex;gap:8px;flex-wrap:wrap">
                     <label style="display:flex;align-items:center;gap:6px;cursor:pointer;font-size:clamp(12px,2.5vw,14px)">
-                        <input type="radio" name="msgType" value="text" checked style="accent-color:#e94560"> Text
+                        <input type="radio" name="msgType" value="text" checked onchange="convertMsgDataFields('text')" style="accent-color:#e94560"> Text
                     </label>
                     <label style="display:flex;align-items:center;gap:6px;cursor:pointer;font-size:clamp(12px,2.5vw,14px)">
-                        <input type="radio" name="msgType" value="hex" style="accent-color:#e94560"> Hex
+                        <input type="radio" name="msgType" value="json" onchange="convertMsgDataFields('json')" style="accent-color:#ffaa00"> JSON
+                    </label>
+                    <label style="display:flex;align-items:center;gap:6px;cursor:pointer;font-size:clamp(12px,2.5vw,14px)">
+                        <input type="radio" name="msgType" value="hex" onchange="convertMsgDataFields('hex')" style="accent-color:#e94560"> Hex
                     </label>
                 </div>
             </div>
-            <div class="form-group">
-                <label for="msgData">Message Data</label>
-                <input type="text" id="msgData" placeholder="Enter message text or hex (e.g., 48656c6c6f)" style="font-family:monospace">
+
+            <div style="margin-bottom:12px">
+                <div class="msg-toolbar">
+                    <label style="display:flex;align-items:center;gap:6px;cursor:pointer;font-size:13px;color:#c8d3f5;margin-right:auto">
+                        <input type="checkbox" id="selectAllMsgs" onchange="toggleSelectAll()" style="accent-color:#e94560;width:18px;height:18px">
+                        <span style="font-weight:600">Select All</span>
+                    </label>
+                    <div style="display:flex;gap:8px;align-items:center">
+                        <div class="form-group" style="display:flex;align-items:center;gap:8px">
+                            <label style="font-size:12px;color:#8892b0;white-space:nowrap">Interval (ms)</label>
+                            <input type="text" id="sendInterval" value="1000" style="width:70px;padding:6px 8px;background:rgba(0,0,0,0.2);border:1px solid rgba(255,255,255,0.1);border-radius:6px;color:#c8d3f5;font-size:13px;text-align:center" onchange="localStorage.setItem('sendInterval',this.value)">
+                        </div>
+                        <button class="btn btn-primary" onclick="sendSelectedMsgs()">Send</button>
+                        <button class="btn btn-ap-start" onclick="broadcastSelectedMsgs()" style="margin-bottom:0">Broadcast</button>
+                        <button class="btn btn-outline" onclick="removeSelectedMsgs()" style="margin-top:0">Delete</button>
+                    </div>
+                </div>
+
+                <div class="msg-header">
+                    <div class="h-check"></div>
+                    <div class="h-name">Name</div>
+                    <div class="h-data">Message Data</div>
+                </div>
+                <div id="msgRowsContainer" style="display:flex;flex-direction:column;gap:6px;">
+                </div>
+                <button class="btn btn-outline" onclick="addMsgRow()" style="margin-top:12px">+ Add Message Row</button>
             </div>
-            <div style="display:flex;gap:8px;margin-top:12px">
-                <button class="btn btn-primary" id="sendMsgBtn" onclick="sendEspnowMsg()" style="flex:1">Send to Peer</button>
-                <button class="btn btn-ap-start" id="broadcastMsgBtn" onclick="broadcastEspnowMsg()" style="flex:1">Broadcast All</button>
-            </div>
+
             <div style="margin-top:12px">
                 <div class="status-label" style="margin-bottom:6px">Send Result</div>
                 <div id="msgResult" style="background:rgba(0,0,0,0.2);border:1px solid rgba(255,255,255,0.08);border-radius:8px;padding:10px 12px;font-family:monospace;font-size:clamp(11px,2.5vw,13px);min-height:60px;color:#8892b0">
@@ -350,7 +406,44 @@ static esp_err_t root_get_handler(httpd_req_t* req)
         </div>
 
         <div class="card">
+            <h2>&#128229; Received Messages <span id="rxCount" style="font-size:0.7em;color:#8892b0;font-weight:400">(0)</span></h2>
+            <div id="rxMsgs" style="max-height:280px;overflow-y:auto;font-family:monospace;font-size:clamp(10px,2.5vw,12px)">
+                <div style="color:#8892b0;text-align:center;padding:20px">No messages received yet</div>
+            </div>
+        </div>
+
+        <div class="card">
+            <h2>&#128228; Send History <span id="shCount" style="font-size:0.7em;color:#8892b0;font-weight:400">(0)</span></h2>
+            <div id="sendHistory" style="max-height:200px;overflow-y:auto;font-family:monospace;font-size:clamp(10px,2.5vw,12px)">
+                <div style="color:#8892b0;text-align:center;padding:16px">No send history yet</div>
+            </div>
+        </div>
+
+        <div class="card">
             <h2>System</h2>
+            <div style="display:grid;grid-template-columns:1fr 1fr;gap:4px 16px;font-size:12px;margin-bottom:12px;color:#c0c0c0">
+                <span style="color:#8892b0">Chip</span>
+                <span id="hwChip">-</span>
+                <span style="color:#8892b0">CPU</span>
+                <span id="hwCpu">-</span>
+                <span style="color:#8892b0">Flash</span>
+                <span id="hwFlash">-</span>
+                <span style="color:#8892b0">PSRAM</span>
+                <span id="hwPsram">-</span>
+                <span style="color:#8892b0">RAM Total</span>
+                <span id="hwRamTotal">-</span>
+                <span style="color:#8892b0">RAM Free</span>
+                <span id="hwRamFree">-</span>
+                <span style="color:#8892b0">RAM Min Free</span>
+                <span id="hwRamMin">-</span>
+                <span style="color:#8892b0">App Partition</span>
+                <span id="hwAppSize">-</span>
+                <span style="color:#8892b0">Version</span>
+                <span id="hwVersion">-</span>
+                <span style="color:#8892b0">PMK</span>
+                <span id="hwPmk" style="font-family:monospace;font-size:11px;word-break:break-all">-</span>
+            </div>
+            <hr style="border:none;border-top:1px solid rgba(255,255,255,0.06);margin:8px 0">
             <button class="btn btn-danger" onclick="restartDevice()">Restart Device</button>
             <p style="color:#8892b0;margin-top:8px;font-size:12px">Uptime: <span id="uptime">0s</span></p>
         </div>
@@ -604,85 +697,6 @@ static esp_err_t root_get_handler(httpd_req_t* req)
             }).catch(function(){});
         }
 
-        function updateBleStatus(){
-            fetch('/api/ble/status').then(function(r){return r.json()}).then(function(d){
-                var btn=document.getElementById('bleAdvBtn');
-                var dot=document.getElementById('bleDot');
-                if(d.advertising){
-                    btn.textContent='Stop BLE';
-                    btn.className='ble-toggle-btn ble-toggle-on';
-                    dot.className='dot dot-online';
-                }else{
-                    btn.textContent='Start BLE';
-                    btn.className='ble-toggle-btn ble-toggle-off';
-                    dot.className='dot dot-offline';
-                }
-                if(d.scanning){
-                    document.getElementById('bleScanSpinner').style.display='inline-block';
-                }
-            });
-        }
-
-        function toggleAdvertise(){
-            fetch('/api/ble/status').then(function(r){return r.json()}).then(function(d){
-                var name=document.getElementById('bleName').value.trim();
-                var enable=d.advertising?'0':'1';
-                fetch('/api/ble/advertise',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'enable='+enable+'&name='+encodeURIComponent(name)}).then(function(r){return r.json()}).then(function(){
-                    updateBleStatus();
-                    showToast(d.advertising?'BLE stopped':'BLE advertising started','success');
-                });
-            });
-        }
-
-        var bleScanTimer=null;
-        function startBleScan(){
-            var btn=document.getElementById('bleScanBtn');
-            if(bleScanTimer){clearInterval(bleScanTimer);bleScanTimer=null;}
-            btn.disabled=true;
-            btn.textContent='Scanning...';
-            document.getElementById('bleScanSpinner').style.display='inline-block';
-            document.getElementById('bleScanStatus').textContent='Scanning for BLE devices...';
-            document.getElementById('bleDevList').innerHTML='<div class="dhcp-empty">Scanning...</div>';
-            fetch('/api/ble/scan',{method:'POST'});
-            function poll(){
-                fetch('/api/ble/devices?_='+Date.now()).then(function(r){return r.json()}).then(function(data){
-                    var html='';
-                    if(data.devices&&data.devices.length>0){
-                        for(var i=0;i<data.devices.length;i++){
-                            var d=data.devices[i];
-                            html+='<div class="scan-item">';
-                            html+='<div class="scan-item-icon scan-item-icon-secure">&#128206;</div>';
-                            html+='<div class="scan-item-info">';
-                            html+='<div class="scan-item-ssid">'+d.name+'</div>';
-                            html+='<div class="scan-item-meta">NOW: '+d.now_mac+' &middot; RSSI: '+d.rssi+' dBm</div>';
-                            html+='</div>';
-                            html+='<button class="btn-pair" onclick="pairDevice('+d.index+')">Pair</button>';
-                            html+='</div>';
-                        }
-                    }else if(!data.scanning){
-                        html='<div class="dhcp-empty">No devices discovered</div>';
-                    }
-                    if(html)document.getElementById('bleDevList').innerHTML=html;
-                    if(!data.scanning){
-                        clearInterval(bleScanTimer);bleScanTimer=null;
-                        btn.disabled=false;btn.textContent='Scan BLE Devices';
-                        document.getElementById('bleScanSpinner').style.display='none';
-                        document.getElementById('bleScanStatus').textContent=data.devices&&data.devices.length>0?data.devices.length+' device(s) found':'No devices found';
-                        updateNowPeers();
-                    }
-                });
-            }
-            poll();
-            bleScanTimer=setInterval(poll,800);
-        }
-
-        function pairDevice(index){
-            fetch('/api/ble/pair',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'index='+index}).then(function(r){return r.json()}).then(function(){
-                showToast('Device paired','success');
-                setTimeout(updateNowPeers,500);
-            });
-        }
-
         function updateNowPeers(){
             fetch('/api/now/peers').then(function(r){return r.json()}).then(function(data){
                 var container=document.getElementById('peerTableContainer');
@@ -725,15 +739,55 @@ static esp_err_t root_get_handler(httpd_req_t* req)
                     select.appendChild(opt);
                 }
                 select.value=savedValue;
+                updateSendModeLabel();
             });
         }
 
         function stringToHex(str){
+            // 使用 TextEncoder 正确编码为 UTF-8 字节，支持中文等多字节字符
             var hex='';
-            for(var i=0;i<str.length;i++){
-                hex+=str.charCodeAt(i).toString(16).padStart(2,'0');
+            var bytes=new TextEncoder().encode(str);
+            for(var i=0;i<bytes.length;i++){
+                hex+=bytes[i].toString(16).padStart(2,'0');
             }
             return hex;
+        }
+        
+        function hexToStr(hex){
+            var str='';
+            for(var i=0;i<hex.length;i+=2){
+                str+=String.fromCharCode(parseInt(hex.substr(i,2),16));
+            }
+            return str;
+        }
+        
+        function isValidHex(s){
+            return /^[0-9a-fA-F]+$/.test(s)&&s.length%2===0;
+        }
+        
+        function isValidJson(s){
+            try{JSON.parse(s);return true;}catch(e){return false;}
+        }
+        
+        function formatJson(s){
+            try{return JSON.stringify(JSON.parse(s),null,2);}catch(e){return s;}
+        }
+        
+        function convertMsgDataFields(targetType){
+            var rows=document.querySelectorAll('.msg-row');
+            for(var r=0;r<rows.length;r++){
+                var input=rows[r].querySelector('.msg-data');
+                var val=input.value.trim();
+                if(!val)continue;
+                if(targetType==='hex'){
+                    input.value=stringToHex(val);
+                }else if(targetType==='json'){
+                    if(isValidHex(val))val=hexToStr(val);
+                    input.value=isValidJson(val)?formatJson(val):val;
+                }else if(isValidHex(val)){
+                    input.value=hexToStr(val);
+                }
+            }
         }
 
         function hexToBytes(hex){
@@ -760,7 +814,13 @@ static esp_err_t root_get_handler(httpd_req_t* req)
             }
 
             var hexData;
-            if(msgType==='text'){
+            if(msgType==='text'||msgType==='json'){
+                if(msgType==='json'){
+                    try{JSON.parse(msgData);}catch(e){
+                        resultEl.innerHTML='<span style="color:#ff6666">Error: Invalid JSON</span>';
+                        return;
+                    }
+                }
                 hexData=stringToHex(msgData);
             }else{
                 hexData=msgData.replace(/\s/g,'');
@@ -783,7 +843,7 @@ static esp_err_t root_get_handler(httpd_req_t* req)
             fetch('/api/espnow/send',{
                 method:'POST',
                 headers:{'Content-Type':'application/json'},
-                body:JSON.stringify({mac:targetMac,data:hexData})
+                body:JSON.stringify({mac:targetMac,data:hexData,type:'hex'})
             }).then(function(r){return r.json()}).then(function(d){
                 btn.disabled=false;
                 if(d.success){
@@ -811,7 +871,13 @@ static esp_err_t root_get_handler(httpd_req_t* req)
             }
 
             var hexData;
-            if(msgType==='text'){
+            if(msgType==='text'||msgType==='json'){
+                if(msgType==='json'){
+                    try{JSON.parse(msgData);}catch(e){
+                        resultEl.innerHTML='<span style="color:#ff6666">Error: Invalid JSON</span>';
+                        return;
+                    }
+                }
                 hexData=stringToHex(msgData);
             }else{
                 hexData=msgData.replace(/\s/g,'');
@@ -834,13 +900,13 @@ static esp_err_t root_get_handler(httpd_req_t* req)
             fetch('/api/espnow/broadcast',{
                 method:'POST',
                 headers:{'Content-Type':'application/json'},
-                body:JSON.stringify({data:hexData})
+                body:JSON.stringify({data:hexData,type:'hex'})
             }).then(function(r){return r.json()}).then(function(d){
                 btn.disabled=false;
                 if(d.success){
                     resultEl.innerHTML='<span style="color:#00ff88">Broadcast sent to all peers</span><br>'+
-                        '<span style="color:#8892b0;font-size:11px">Data: '+hexData+' ('+bytes.length+' bytes) | Sent: '+d.count+' peers</span>';
-                    showToast('Broadcast sent to '+d.count+' peers','success');
+                        '<span style="color:#8892b0;font-size:11px">Data: '+hexData+' ('+bytes.length+' bytes)</span>';
+                    showToast('Broadcast sent successfully','success');
                 }else{
                     resultEl.innerHTML='<span style="color:#ff6666">Failed: '+(d.message||'Unknown error')+'</span>';
                     showToast('Broadcast failed','error');
@@ -858,6 +924,304 @@ static esp_err_t root_get_handler(httpd_req_t* req)
             document.getElementById('uptime').textContent=str;
         }
 
+        function toggleSelectAll(){
+            var selectAll=document.getElementById('selectAllMsgs');
+            var checkboxes=document.querySelectorAll('.msg-checkbox');
+            checkboxes.forEach(function(cb){
+                cb.checked=selectAll.checked;
+            });
+        }
+
+        function getSelectedRows(){
+            var rows=document.querySelectorAll('.msg-row');
+            var selected=[];
+            rows.forEach(function(row){
+                var cb=row.querySelector('.msg-checkbox');
+                if(cb.checked){
+                    var name=row.querySelector('.msg-name').value.trim();
+                    var data=row.querySelector('.msg-data').value.trim();
+                    if(name&&data){
+                        selected.push({name:name,data:data});
+                    }
+                }
+            });
+            return selected;
+        }
+
+        function addMsgRow(name,data,backendIndex){
+            var container=document.getElementById('msgRowsContainer');
+            
+            var row=document.createElement('div');
+            row.className='msg-row';
+            if(backendIndex!==undefined){
+                row.setAttribute('data-backend-index',backendIndex);
+            }else{
+                row.setAttribute('data-backend-index','-1');
+            }
+            
+            var checkbox=document.createElement('input');
+            checkbox.type='checkbox';
+            checkbox.className='msg-checkbox';
+            
+            var nameInput=document.createElement('input');
+            nameInput.type='text';
+            nameInput.className='msg-name';
+            nameInput.placeholder='';
+            if(name)nameInput.value=name;
+            nameInput.onblur=function(){saveMsgRow(row);};
+            
+            var dataInput=document.createElement('input');
+            dataInput.type='text';
+            dataInput.className='msg-data';
+            dataInput.placeholder='';
+            if(data){
+                var mode=document.querySelector('input[name="msgType"]:checked').value;
+                if(mode==='json'){
+                    data=hexToStr(data);
+                    if(isValidJson(data))data=formatJson(data);
+                }else if(mode==='text'&&isValidHex(data)){
+                    data=hexToStr(data);
+                }
+                dataInput.value=data;
+            }
+            dataInput.onblur=function(){saveMsgRow(row);};
+            
+            row.appendChild(checkbox);
+            row.appendChild(nameInput);
+            row.appendChild(dataInput);
+            
+            container.appendChild(row);
+        }
+        
+        function saveMsgRow(row){
+            var nameInput=row.querySelector('.msg-name');
+            var dataInput=row.querySelector('.msg-data');
+            var name=nameInput.value.trim();
+            var data=dataInput.value.trim();
+            var backendIndex=parseInt(row.getAttribute('data-backend-index'));
+            
+            if(!name&&!data)return;
+            
+            var msgType=document.querySelector('input[name="msgType"]:checked').value;
+            var hexData=data;
+            if(msgType==='text'||msgType==='json'){
+                if(msgType==='json'&&!isValidJson(data)){
+                    showToast('Invalid JSON','error');
+                    return;
+                }
+                hexData=stringToHex(data);
+            }else{
+                hexData=data.replace(/\s/g,'');
+                if(!/^[0-9a-fA-F]*$/.test(hexData))return;
+            }
+            if(hexData.length>500)return;
+            
+            if(backendIndex>=0){
+                var body={index:backendIndex,name:name,data:hexData};
+                fetch('/api/espnow/templates/update',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}).then(function(r){return r.json()}).then(function(d){
+                    if(d.success)showToast('Auto-saved','success');
+                });
+            }else{
+                var body={name:name,data:hexData};
+                fetch('/api/espnow/templates/add',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}).then(function(r){return r.json()}).then(function(d){
+                    if(d.success)loadMsgRows();
+                });
+            }
+        }
+        
+        function loadMsgRows(){
+            fetch('/api/espnow/templates').then(function(r){return r.json()}).then(function(data){
+                var container=document.getElementById('msgRowsContainer');
+                container.innerHTML='';
+                if(data&&data.length>0){
+                    for(var i=0;i<data.length;i++){
+                        var t=data[i];
+                        addMsgRow(t.name,t.data,t.index);
+                    }
+                }
+            });
+        }
+
+        function removeSelectedMsgs(){
+            var checkboxes=document.querySelectorAll('.msg-checkbox:checked');
+            if(checkboxes.length===0){
+                showToast('Please select messages to delete','error');
+                return;
+            }
+            if(!confirm('Delete selected '+checkboxes.length+' message(s)?'))return;
+            
+            var indices=[];
+            checkboxes.forEach(function(cb){
+                var row=cb.parentElement;
+                var idx=parseInt(row.getAttribute('data-backend-index'));
+                if(idx>=0){
+                    indices.push(idx);
+                }
+                row.parentElement.removeChild(row);
+            });
+            
+            if(indices.length===0){
+                document.getElementById('selectAllMsgs').checked=false;
+                showToast('Deleted','success');
+                return;
+            }
+            
+            indices.sort(function(a,b){return a-b;});
+            
+            function deleteNext(i){
+                if(i<0){
+                    document.getElementById('selectAllMsgs').checked=false;
+                    showToast('Deleted','success');
+                    loadMsgRows();
+                    return;
+                }
+                fetch('/api/espnow/templates/remove',{
+                    method:'POST',
+                    headers:{'Content-Type':'application/json'},
+                    body:JSON.stringify({index:indices[i]})
+                }).then(function(r){return r.json()}).then(function(d){
+                    deleteNext(i-1);
+                });
+            }
+            deleteNext(indices.length-1);
+        }
+
+        function updateSendModeLabel(){
+            var sel=document.getElementById('msgTargetPeer');
+            var label=document.getElementById('sendModeLabel');
+            if(sel.value){
+                label.style.display='inline-block';
+                label.style.background='rgba(0,200,255,0.15)';
+                label.style.color='#00c8ff';
+                label.style.border='1px solid rgba(0,200,255,0.3)';
+                label.textContent='Unicast: '+sel.value;
+            }else{
+                label.style.display='inline-block';
+                label.style.background='rgba(200,100,255,0.15)';
+                label.style.color='#c864ff';
+                label.style.border='1px solid rgba(200,100,255,0.3)';
+                label.textContent='Broadcast';
+            }
+        }
+
+        function sendSelectedMsgs(){
+            var selected=getSelectedRows();
+            var targetMac=document.getElementById('msgTargetPeer').value;
+            
+            if(selected.length===0){
+                showToast('Please select messages to send','error');
+                return;
+            }
+            if(!targetMac){
+                showToast('Please select a peer first','error');
+                return;
+            }
+            
+            var msgType=document.querySelector('input[name="msgType"]:checked').value;
+            var interval=parseInt(document.getElementById('sendInterval').value)||0;
+            sendMessages(selected,targetMac,msgType,interval,false);
+        }
+
+        function broadcastSelectedMsgs(){
+            var selected=getSelectedRows();
+            
+            if(selected.length===0){
+                showToast('Please select messages to broadcast','error');
+                return;
+            }
+            
+            var msgType=document.querySelector('input[name="msgType"]:checked').value;
+            var interval=parseInt(document.getElementById('sendInterval').value)||0;
+            sendMessages(selected,null,msgType,interval,true);
+        }
+
+        function sendMessages(messages,mac,msgType,interval,isBroadcast){
+            var index=0;
+            var successCount=0;
+            var failCount=0;
+            var resultEl=document.getElementById('msgResult');
+            var modeLabel=isBroadcast?'<span style="color:#c864ff">Broadcast</span>':'<span style="color:#00c8ff">Unicast: '+mac+'</span>';
+            
+            function processData(rawData,isText){
+                if(isText==='text'||isText==='json'){
+                    if(isText==='json'&&!isValidJson(rawData)){
+                        return null;
+                    }
+                    return stringToHex(rawData);
+                }else{
+                    var hex=rawData.replace(/\s/g,'');
+                    if(!/^[0-9a-fA-F]*$/.test(hex)||hex.length%2!==0){
+                        return null;
+                    }
+                    return hex;
+                }
+            }
+            
+            function sendNext(){
+                if(index>=messages.length){
+                    var result='OK='+successCount+', Fail='+failCount;
+                    resultEl.innerHTML=modeLabel+'<br><span style="color:'+(failCount>0?'#ffaa00':'#00ff88')+'">'+result+'</span>';
+                    if(isBroadcast){
+                        showToast('Broadcast completed: '+result,'success');
+                    }else{
+                        showToast('Send completed: '+result,'success');
+                    }
+                    return;
+                }
+                
+                var msg=messages[index];
+                var hexData=processData(msg.data,msgType);
+                if(!hexData){
+                    resultEl.innerHTML=modeLabel+'<br><span style="color:#ff6666">Msg '+(index+1)+'/'+messages.length+' skipped: invalid data</span>';
+                    failCount++;
+                    index++;
+                    sendNext();
+                    return;
+                }
+                
+                var bytes=hexToBytes(hexData);
+                if(bytes.length>250){
+                    resultEl.innerHTML=modeLabel+'<br><span style="color:#ff6666">Msg '+(index+1)+'/'+messages.length+' skipped: too long ('+bytes.length+' bytes)</span>';
+                    failCount++;
+                    index++;
+                    sendNext();
+                    return;
+                }
+                
+                resultEl.innerHTML=modeLabel+'<br><span style="color:#ffaa00">Sending '+(index+1)+'/'+messages.length+'...</span>';
+                
+                var url=isBroadcast?'/api/espnow/broadcast':'/api/espnow/send';
+                var body={data:hexData,type:'hex'};
+                if(!isBroadcast)body.mac=mac;
+                
+                fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}).then(function(r){return r.json()}).then(function(d){
+                    if(d.success){
+                        successCount++;
+                    }else{
+                        failCount++;
+                    }
+                    index++;
+                    if(interval>0&&index<messages.length){
+                        setTimeout(sendNext,interval);
+                    }else{
+                        sendNext();
+                    }
+                }).catch(function(){
+                    failCount++;
+                    index++;
+                    if(interval>0&&index<messages.length){
+                        setTimeout(sendNext,interval);
+                    }else{
+                        sendNext();
+                    }
+                });
+            }
+            
+            showToast('Sending '+messages.length+' message(s)...','info');
+            resultEl.innerHTML=modeLabel+'<br><span style="color:#00c8ff">Sending '+messages.length+' message(s)...</span>';
+            sendNext();
+        }
+
         updateStatus();
         setInterval(updateStatus,2000);
         updateDhcpClients();
@@ -865,13 +1229,177 @@ static esp_err_t root_get_handler(httpd_req_t* req)
         updateNowMac();
         updateEspnowMaster();
         setInterval(updateEspnowMaster,5000);
-        updateBleStatus();
-        setInterval(updateBleStatus,2000);
         updateNowPeers();
         setInterval(updateNowPeers,3000);
         updatePeerSelect();
         setInterval(updatePeerSelect,3000);
+        loadMsgRows();
         setInterval(updateUptime,1000);
+        loadReceivedMsgs();
+        setInterval(loadReceivedMsgs,3000);
+        loadSendHistory();
+        setInterval(loadSendHistory,5000);
+        updateRoleStatus();
+        setInterval(updateRoleStatus,2000);
+        loadHwInfo();
+        setInterval(loadHwInfo,10000);
+
+        // 加载保存的发送间隔
+        var savedInterval=localStorage.getItem('sendInterval');
+        if(savedInterval) document.getElementById('sendInterval').value=savedInterval;
+
+        function loadReceivedMsgs(){
+            fetch('/api/espnow/messages').then(function(r){return r.json()}).then(function(data){
+                var el=document.getElementById('rxMsgs');
+                var cnt=document.getElementById('rxCount');
+                if(!data||data.length===0){
+                    cnt.textContent='(0)';
+                    el.innerHTML='<div style="color:#8892b0;text-align:center;padding:20px">No messages received yet</div>';
+                    return;
+                }
+                cnt.textContent='('+data.length+')';
+                var h='';
+                for(var i=data.length-1;i>=0;i--){
+                    var m=data[i];
+                    var mac=m.mac||'??:??:??:??:??:??';
+                    var len=m.len||0;
+                    var full=m.data||'';
+                    var bg=i%2===0?'rgba(255,255,255,0.03)':'transparent';
+                    h+='<div onclick="toggleMsg(this)" style="cursor:pointer;border-radius:4px;display:flex;gap:8px;padding:6px 8px;background:'+bg+';border-bottom:1px solid rgba(255,255,255,0.04);align-items:flex-start" onmouseover="this.style.background=\'rgba(233,69,96,0.08)\'" onmouseout="this.style.background=\''+bg+'\'">';
+                    h+='<span style="color:#00c8ff;min-width:100px;flex-shrink:0">'+mac+'</span>';
+                    h+='<span style="color:#00ff88;min-width:36px;flex-shrink:0">'+len+'B</span>';
+                    h+='<span class="msg-data" style="flex:1;min-width:0;color:#c0c0c0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis" data-full="'+escHtml(full)+'">'+escHtml(full)+'</span>';
+                    h+='</div>';
+                }
+                el.innerHTML=h;
+            }).catch(function(e){
+                document.getElementById('rxMsgs').innerHTML='<div style="color:#ff6666;text-align:center;padding:20px">Failed to load</div>';
+            });
+        }
+
+        function toggleMsg(el){
+            var span=el.querySelector('.msg-data');
+            if(span.style.whiteSpace==='normal'){
+                span.style.whiteSpace='nowrap';
+                span.style.overflow='hidden';
+                span.style.textOverflow='ellipsis';
+            }else{
+                span.style.whiteSpace='normal';
+                span.style.overflow='visible';
+                span.style.textOverflow='clip';
+            }
+        }
+
+        function loadSendHistory(){
+            fetch('/api/espnow/send/history').then(function(r){return r.json()}).then(function(data){
+                var el=document.getElementById('sendHistory');
+                var cnt=document.getElementById('shCount');
+                if(!data||data.length===0){
+                    cnt.textContent='(0)';
+                    el.innerHTML='<div style="color:#8892b0;text-align:center;padding:16px">No send history yet</div>';
+                    return;
+                }
+                cnt.textContent='('+data.length+')';
+                var h='';
+                for(var i=data.length-1;i>=0;i--){
+                    var e=data[i];
+                    var mac=e.mac||'??:??:??:??:??:??';
+                    var len=e.len||0;
+                    var ok=e.success!==false;
+                    var bc=e.broadcast===true;
+                    var acked=e.acked===true;
+                    var status=ok?'<span style="color:#00ff88">OK</span>':'<span style="color:#ff4444">FAIL</span>';
+                    var ackTag='';
+                    if(!bc&&ok){
+                        ackTag=acked
+                            ?'<span style="display:inline-block;background:rgba(0,255,136,0.12);color:#00ff88;border:1px solid rgba(0,255,136,0.25);padding:1px 6px;border-radius:8px;font-size:9px;font-weight:600;margin-left:4px">ACK&#10003;</span>'
+                            :'<span style="display:inline-block;background:rgba(255,170,0,0.12);color:#ffaa00;border:1px solid rgba(255,170,0,0.2);padding:1px 6px;border-radius:8px;font-size:9px;font-weight:600;margin-left:4px">ACK...</span>';
+                    }
+                    var mode=bc?'<span style="display:inline-block;background:rgba(200,100,255,0.15);color:#c864ff;border:1px solid rgba(200,100,255,0.3);padding:1px 6px;border-radius:8px;font-size:9px;font-weight:600;margin-left:6px">Broadcast</span>':'<span style="display:inline-block;background:rgba(0,200,255,0.12);color:#00c8ff;border:1px solid rgba(0,200,255,0.25);padding:1px 6px;border-radius:8px;font-size:9px;font-weight:600;margin-left:6px">Unicast</span>';
+                    var bg=i%2===0?'rgba(255,255,255,0.03)':'transparent';
+                    h+='<div style="display:flex;gap:8px;padding:5px 8px;background:'+bg+';border-bottom:1px solid rgba(255,255,255,0.04);align-items:center">';
+                    h+='<span style="color:#00c8ff;min-width:100px;flex-shrink:0">'+mac+'</span>';
+                    h+='<span style="color:#8892b0;min-width:30px;flex-shrink:0">'+len+'B</span>';
+                    h+=status+ackTag+mode;
+                    h+='</div>';
+                }
+                el.innerHTML=h;
+            }).catch(function(e){
+                document.getElementById('sendHistory').innerHTML='<div style="color:#ff6666;text-align:center;padding:16px">Failed to load</div>';
+            });
+        }
+
+        function fmtSize(bytes){
+            if(!bytes||bytes===0)return'0 B';
+            if(bytes>=1073741824)return(bytes/1073741824).toFixed(1)+' GB';
+            if(bytes>=1048576)return(bytes/1048576).toFixed(1)+' MB';
+            if(bytes>=1024)return(bytes/1024).toFixed(0)+' KB';
+            return bytes+' B';
+        }
+
+        function loadHwInfo(){
+            fetch('/api/system/hwinfo').then(function(r){return r.json()}).then(function(d){
+                if(!d)return;
+                document.getElementById('hwChip').textContent=d.chip||'-';
+                document.getElementById('hwCpu').textContent=d.cpu_freq+' MHz x'+d.cores;
+                document.getElementById('hwFlash').textContent=fmtSize(d.flash_size);
+                document.getElementById('hwPsram').textContent=d.psram_size>0?fmtSize(d.psram_size):'N/A';
+                document.getElementById('hwRamTotal').textContent=fmtSize(d.heap_total);
+                document.getElementById('hwRamFree').textContent=fmtSize(d.heap_free);
+                document.getElementById('hwRamMin').textContent=fmtSize(d.heap_min_free);
+                document.getElementById('hwAppSize').textContent=d.app_size>0?fmtSize(d.app_size):'-';
+                document.getElementById('hwVersion').textContent=d.version||'-';
+                document.getElementById('hwPmk').textContent=d.pmk||'-';
+            }).catch(function(){});
+        }
+
+        // ===== Role Control =====
+        function updateRoleStatus(){
+            fetch('/api/ble/name').then(function(r){return r.json()}).then(function(d){
+                var el=document.getElementById('bleName');
+                if(document.activeElement!==el) el.value=d.name||'';
+            }).catch(function(){});
+            fetch('/api/espnow/role/status').then(function(r){return r.json()}).then(function(d){
+                document.getElementById('roleSelect').value=d.role;
+                document.getElementById('roleState').textContent=d.state;
+                document.getElementById('roleRemaining').textContent=d.remaining+'s';
+                document.getElementById('rolePeers').textContent=d.peers;
+                document.getElementById('roleStartBtn').disabled=(d.role==0||d.state!=='IDLE');
+                document.getElementById('roleStopBtn').disabled=(d.state!=='ACTIVE');
+            }).catch(function(){});
+        }
+
+        function changeRole(){
+            var role=parseInt(document.getElementById('roleSelect').value);
+            fetch('/api/espnow/role',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({role:role})}).then(function(r){return r.json()}).then(function(d){
+                showToast(d.success?'Role updated':'Failed','success');
+                updateRoleStatus();
+            });
+        }
+
+        function startRole(){
+            fetch('/api/espnow/role/start',{method:'POST'}).then(function(r){return r.json()}).then(function(d){
+                showToast(d.success?'Started':'Failed to start',d.success?'success':'error');
+                updateRoleStatus();
+            });
+        }
+
+        function stopRole(){
+            fetch('/api/espnow/role/stop',{method:'POST'}).then(function(r){return r.json()}).then(function(d){
+                showToast(d.success?'Stopped':'Failed to stop',d.success?'success':'error');
+                updateRoleStatus();
+            });
+        }
+
+        function saveDeviceName(){
+            var name=document.getElementById('bleName').value.trim();
+            if(!name) return;
+            fetch('/api/ble/name',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:name})}).catch(function(){});
+        }
+
+        function escHtml(s){
+            return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+        }
     </script>
 </body>
 </html>
@@ -886,7 +1414,7 @@ static esp_err_t api_wifi_status_handler(httpd_req_t* req)
 {
     char buffer[1024];
     wifi_service_get_status_json(buffer, sizeof(buffer));
-    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_type(req, "application/json; charset=utf-8");
     httpd_resp_send(req, buffer, strlen(buffer));
     return ESP_OK;
 }
@@ -934,7 +1462,7 @@ static esp_err_t api_wifi_connect_handler(httpd_req_t* req)
     }
 
     if (strlen(ssid) == 0 || strlen(password) == 0) {
-        httpd_resp_set_type(req, "application/json");
+        httpd_resp_set_type(req, "application/json; charset=utf-8");
         httpd_resp_send(req, "{\"success\":false,\"message\":\"SSID or password empty\"}",
                         HTTPD_RESP_USE_STRLEN);
         return ESP_OK;
@@ -944,7 +1472,7 @@ static esp_err_t api_wifi_connect_handler(httpd_req_t* req)
     wifi_service_post_connect(ssid, password);
     ESP_LOGI(TAG, "WiFi connect queued: SSID=%s", ssid);
 
-    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_type(req, "application/json; charset=utf-8");
     httpd_resp_send(req, "{\"success\":true,\"message\":\"Connecting...\"}",
                     HTTPD_RESP_USE_STRLEN);
     return ESP_OK;
@@ -969,7 +1497,7 @@ static esp_err_t api_wifi_mode_handler(httpd_req_t* req)
         }
     }
 
-    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_type(req, "application/json; charset=utf-8");
     httpd_resp_send(req, "{\"success\":true}", HTTPD_RESP_USE_STRLEN);
     return ESP_OK;
 }
@@ -992,7 +1520,7 @@ static esp_err_t api_ap_start_handler(httpd_req_t* req)
         wifi_service_post_start_ap(NULL, NULL);
     }
 
-    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_type(req, "application/json; charset=utf-8");
     httpd_resp_send(req, "{\"success\":true}", HTTPD_RESP_USE_STRLEN);
     return ESP_OK;
 }
@@ -1001,14 +1529,14 @@ static esp_err_t api_ap_stop_handler(httpd_req_t* req)
 {
     wifi_service_post_stop_ap();
 
-    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_type(req, "application/json; charset=utf-8");
     httpd_resp_send(req, "{\"success\":true}", HTTPD_RESP_USE_STRLEN);
     return ESP_OK;
 }
 
 static esp_err_t api_restart_handler(httpd_req_t* req)
 {
-    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_type(req, "application/json; charset=utf-8");
     httpd_resp_send(req, "{\"success\":true}", HTTPD_RESP_USE_STRLEN);
     vTaskDelay(pdMS_TO_TICKS(500));
     esp_restart();
@@ -1019,7 +1547,7 @@ static esp_err_t api_dhcp_clients_handler(httpd_req_t* req)
 {
     char buffer[768];
     wifi_service_get_dhcp_clients_json(buffer, sizeof(buffer));
-    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_type(req, "application/json; charset=utf-8");
     httpd_resp_send(req, buffer, strlen(buffer));
     return ESP_OK;
 }
@@ -1116,7 +1644,7 @@ static void scan_task(void* arg)
 static esp_err_t api_wifi_scan_handler(httpd_req_t* req)
 {
     httpd_resp_set_hdr(req, "Cache-Control", "no-cache, no-store, must-revalidate");
-    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_type(req, "application/json; charset=utf-8");
 
     wifi_mode_t mode;
     esp_wifi_get_mode(&mode);
@@ -1152,7 +1680,7 @@ static esp_err_t api_ble_status_handler(httpd_req_t* req)
     snprintf(buf, sizeof(buf),
              "{\"state\":%d,\"advertising\":%s,\"scanning\":%s}",
              (int)st, adv ? "true" : "false", scn ? "true" : "false");
-    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_type(req, "application/json; charset=utf-8");
     httpd_resp_send(req, buf, strlen(buf));
     return ESP_OK;
 }
@@ -1181,7 +1709,59 @@ static esp_err_t api_ble_advertise_handler(httpd_req_t* req)
             }
         }
     }
-    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_type(req, "application/json; charset=utf-8");
+    httpd_resp_send(req, "{\"success\":true}", HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+
+static esp_err_t api_ble_name_get_handler(httpd_req_t* req)
+{
+    char name[BLE_DEV_NAME_MAX] = {0};
+    ble_pairing_get_name(name);
+    // 转义JSON特殊字符
+    char json_name[BLE_DEV_NAME_MAX * 2] = {0};
+    int pos = 0;
+    for (int i = 0; name[i] && pos < (int)sizeof(json_name) - 2; i++) {
+        char c = name[i];
+        if (c == '"' || c == '\\') json_name[pos++] = '\\';
+        json_name[pos++] = c;
+    }
+    json_name[pos] = '\0';
+    char buf[96];
+    snprintf(buf, sizeof(buf), "{\"name\":\"%s\"}", json_name);
+    httpd_resp_set_type(req, "application/json; charset=utf-8");
+    httpd_resp_send(req, buf, strlen(buf));
+    return ESP_OK;
+}
+
+static esp_err_t api_ble_name_set_handler(httpd_req_t* req)
+{
+    char buf[128] = {0};
+    int ret = httpd_req_recv(req, buf, sizeof(buf) - 1);
+    if (ret > 0) {
+        buf[ret] = '\0';
+        // 支持JSON格式 {"name":"xxx"} 和 URL编码 name=xxx
+        char* name = NULL;
+        char* js = strstr(buf, "\"name\":\"");
+        if (js) {
+            js += 8;
+            char* end = strchr(js, '"');
+            if (end) *end = '\0';
+            name = js;
+        } else {
+            char* nv = strstr(buf, "name=");
+            if (nv) {
+                nv += 5;
+                char* amp = strchr(nv, '&');
+                if (amp) *amp = '\0';
+                name = nv;
+            }
+        }
+        if (name && name[0]) {
+            ble_pairing_set_name(name);
+        }
+    }
+    httpd_resp_set_type(req, "application/json; charset=utf-8");
     httpd_resp_send(req, "{\"success\":true}", HTTPD_RESP_USE_STRLEN);
     return ESP_OK;
 }
@@ -1189,7 +1769,7 @@ static esp_err_t api_ble_advertise_handler(httpd_req_t* req)
 static esp_err_t api_ble_scan_handler(httpd_req_t* req)
 {
     ble_pairing_start_scan(10);
-    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_type(req, "application/json; charset=utf-8");
     httpd_resp_send(req, "{\"success\":true}", HTTPD_RESP_USE_STRLEN);
     return ESP_OK;
 }
@@ -1214,7 +1794,7 @@ static esp_err_t api_ble_devices_handler(httpd_req_t* req)
                         i, bmac, nmac, devices[i].name, devices[i].rssi);
     }
     snprintf(buf + pos, sizeof(buf) - pos, "]}");
-    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_type(req, "application/json; charset=utf-8");
     httpd_resp_send(req, buf, strlen(buf));
     return ESP_OK;
 }
@@ -1277,7 +1857,7 @@ static esp_err_t api_ble_pair_handler(httpd_req_t* req)
             ble_pairing_pair_with_device(idx);
         }
     }
-    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_type(req, "application/json; charset=utf-8");
     httpd_resp_send(req, "{\"success\":true}", HTTPD_RESP_USE_STRLEN);
     return ESP_OK;
 }
@@ -1286,7 +1866,7 @@ static esp_err_t api_now_peers_handler(httpd_req_t* req)
 {
     char buffer[2048];
     wifi_now_get_peers_json(buffer, sizeof(buffer));
-    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_type(req, "application/json; charset=utf-8");
     httpd_resp_send(req, buffer, strlen(buffer));
     return ESP_OK;
 }
@@ -1315,7 +1895,7 @@ static esp_err_t api_now_peer_remove_handler(httpd_req_t* req)
             }
         }
     }
-    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_type(req, "application/json; charset=utf-8");
     httpd_resp_send(req, "{\"success\":true}", HTTPD_RESP_USE_STRLEN);
     return ESP_OK;
 }
@@ -1326,7 +1906,7 @@ static esp_err_t api_now_mac_handler(httpd_req_t* req)
     char buf[64];
     snprintf(buf, sizeof(buf),
              "{\"mac\":\"" MACSTR "\"}", MAC2STR(mac));
-    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_type(req, "application/json; charset=utf-8");
     httpd_resp_send(req, buf, strlen(buf));
     return ESP_OK;
 }
@@ -1393,10 +1973,22 @@ static esp_err_t api_espnow_register_handler(httpd_req_t* req)
                  MAC2STR(mac), channel, name);
 
         if (wifi_now_is_initialized()) {
+            // 获取S3当前ESP-NOW信道
+            uint8_t s3_now_channel = wifi_now_get_channel();
+            ESP_LOGI(TAG, "S3 ESP-NOW channel: %d, Client reports channel: %d",
+                     s3_now_channel, channel);
+            // 如果客户端报告的信道与S3不同，使用S3的信道
+            uint8_t use_channel = (uint8_t)channel;
+            if (use_channel != s3_now_channel) {
+                ESP_LOGW(TAG, "Channel mismatch! Client=%d, S3=%d. Using S3's channel %d",
+                         channel, s3_now_channel, s3_now_channel);
+                use_channel = s3_now_channel;
+            }
+            
             if (name[0]) {
-                ok = wifi_now_add_peer_with_name(mac, (uint8_t)channel, name);
+                ok = wifi_now_add_peer_with_name(mac, use_channel, name, PEER_TYPE_WIFI);
             } else {
-                ok = wifi_now_add_peer(mac, (uint8_t)channel);
+                ok = wifi_now_add_peer_with_name(mac, use_channel, "", PEER_TYPE_WIFI);
             }
 
             if (ok) {
@@ -1425,7 +2017,7 @@ static esp_err_t api_espnow_register_handler(httpd_req_t* req)
 
     ESP_LOGI(TAG, "Sending response: %s", buf);
 
-    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_type(req, "application/json; charset=utf-8");
     int send_ret = httpd_resp_send(req, buf, strlen(buf));
     if (send_ret == ESP_OK) {
         ESP_LOGI(TAG, "Response sent successfully");
@@ -1443,7 +2035,7 @@ static esp_err_t api_espnow_master_handler(httpd_req_t* req)
     snprintf(buf, sizeof(buf),
              "{\"mac\":\"" MACSTR "\",\"channel\":%d}",
              MAC2STR(mac), wifi_now_get_channel());
-    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_type(req, "application/json; charset=utf-8");
     httpd_resp_send(req, buf, strlen(buf));
     return ESP_OK;
 }
@@ -1492,7 +2084,7 @@ static esp_err_t api_espnow_unpair_handler(httpd_req_t* req)
     }
 
     snprintf(buf, sizeof(buf), "{\"success\":%s}", ok ? "true" : "false");
-    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_type(req, "application/json; charset=utf-8");
     httpd_resp_send(req, buf, strlen(buf));
     return ESP_OK;
 }
@@ -1510,6 +2102,7 @@ static esp_err_t api_espnow_send_handler(httpd_req_t* req)
     uint8_t mac[6] = {0};
     char* data = NULL;
     int data_len = 0;
+    bool is_text = true;
 
     char* mac_str = strstr(buf, "\"mac\"");
     if (mac_str) {
@@ -1522,6 +2115,18 @@ static esp_err_t api_espnow_send_handler(httpd_req_t* req)
                        &vals[0], &vals[1], &vals[2],
                        &vals[3], &vals[4], &vals[5]) == 6) {
                 for (int i = 0; i < 6; i++) mac[i] = (uint8_t)vals[i];
+            }
+        }
+    }
+
+    char* type_str = strstr(buf, "\"type\"");
+    if (type_str) {
+        type_str = strchr(type_str, ':');
+        if (type_str) {
+            type_str++;
+            while (*type_str && (*type_str == ' ' || *type_str == '"')) type_str++;
+            if (strncmp(type_str, "hex", 3) == 0) {
+                is_text = false;
             }
         }
     }
@@ -1545,7 +2150,12 @@ static esp_err_t api_espnow_send_handler(httpd_req_t* req)
     uint8_t bin_buf[250];
     int bin_len = 0;
     if (data && data_len > 0) {
-        bin_len = hex_decode(data, bin_buf, sizeof(bin_buf));
+        if (is_text) {
+            bin_len = data_len;
+            memcpy(bin_buf, data, bin_len);
+        } else {
+            bin_len = hex_decode(data, bin_buf, sizeof(bin_buf));
+        }
     }
 
     bool ok = false;
@@ -1553,8 +2163,8 @@ static esp_err_t api_espnow_send_handler(httpd_req_t* req)
 
     if (mac[0] || mac[1] || mac[2] || mac[3] || mac[4] || mac[5]) {
         if (bin_len > 0) {
-            ESP_LOGI(TAG, "Sending ESP-NOW data to " MACSTR " (len=%d)",
-                     MAC2STR(mac), bin_len);
+            ESP_LOGI(TAG, "Sending ESP-NOW data to " MACSTR " (len=%d, type=%s)",
+                     MAC2STR(mac), bin_len, is_text ? "text" : "hex");
 
             sent_len = wifi_now_send(mac, bin_buf, bin_len);
             if (sent_len == 0) {
@@ -1574,7 +2184,7 @@ static esp_err_t api_espnow_send_handler(httpd_req_t* req)
              "{\"success\":%s,\"sent\":%d}",
              ok ? "true" : "false",
              ok ? bin_len : 0);
-    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_type(req, "application/json; charset=utf-8");
     httpd_resp_send(req, buf, strlen(buf));
     return ESP_OK;
 }
@@ -1591,6 +2201,19 @@ static esp_err_t api_espnow_broadcast_handler(httpd_req_t* req)
 
     char* data = NULL;
     int data_len = 0;
+    bool is_text = true;
+
+    char* type_str = strstr(buf, "\"type\"");
+    if (type_str) {
+        type_str = strchr(type_str, ':');
+        if (type_str) {
+            type_str++;
+            while (*type_str && (*type_str == ' ' || *type_str == '"')) type_str++;
+            if (strncmp(type_str, "hex", 3) == 0) {
+                is_text = false;
+            }
+        }
+    }
 
     char* data_str = strstr(buf, "\"data\"");
     if (data_str) {
@@ -1611,7 +2234,12 @@ static esp_err_t api_espnow_broadcast_handler(httpd_req_t* req)
     uint8_t bin_buf[250];
     int bin_len = 0;
     if (data && data_len > 0) {
-        bin_len = hex_decode(data, bin_buf, sizeof(bin_buf));
+        if (is_text) {
+            bin_len = data_len;
+            memcpy(bin_buf, data, bin_len);
+        } else {
+            bin_len = hex_decode(data, bin_buf, sizeof(bin_buf));
+        }
     }
 
     bool ok = false;
@@ -1635,7 +2263,501 @@ static esp_err_t api_espnow_broadcast_handler(httpd_req_t* req)
              "{\"success\":%s,\"sent\":%d}",
              ok ? "true" : "false",
              ok ? bin_len : 0);
-    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_type(req, "application/json; charset=utf-8");
+    httpd_resp_send(req, buf, strlen(buf));
+    return ESP_OK;
+}
+
+static esp_err_t api_espnow_templates_get_handler(httpd_req_t* req)
+{
+    char buffer[4096];
+    wifi_now_get_msg_templates_json(buffer, sizeof(buffer));
+    httpd_resp_set_type(req, "application/json; charset=utf-8");
+    httpd_resp_send(req, buffer, strlen(buffer));
+    return ESP_OK;
+}
+
+static esp_err_t api_espnow_template_add_handler(httpd_req_t* req)
+{
+    char buf[1024];
+    int ret = httpd_req_recv(req, buf, sizeof(buf) - 1);
+    if (ret <= 0) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Failed to receive data");
+        return ESP_FAIL;
+    }
+    buf[ret] = '\0';
+
+    char* name = NULL;
+    char* data = NULL;
+    int data_len = 0;
+
+    // IMPORTANT: parse 'data' BEFORE 'name' because name parsing null-terminates the buffer
+    char* data_str = strstr(buf, "\"data\"");
+    if (data_str) {
+        data_str = strchr(data_str, ':');
+        if (data_str) {
+            data_str++;
+            while (*data_str && (*data_str == ' ' || *data_str == '"')) data_str++;
+            char* end = strchr(data_str, '"');
+            if (end) {
+                *end = '\0';
+                data = data_str;
+                data_len = strlen(data);
+            }
+        }
+    }
+
+    char* name_str = strstr(buf, "\"name\"");
+    if (name_str) {
+        name_str = strchr(name_str, ':');
+        if (name_str) {
+            name_str++;
+            while (*name_str && (*name_str == ' ' || *name_str == '"')) name_str++;
+            char* end = strchr(name_str, '"');
+            if (end) {
+                *end = '\0';
+                name = name_str;
+            }
+        }
+    }
+
+    uint8_t bin_buf[250];
+    int bin_len = 0;
+    if (data && data_len > 0) {
+        bin_len = hex_decode(data, bin_buf, sizeof(bin_buf));
+    }
+
+    bool ok = false;
+    if (name) {
+        ok = wifi_now_add_msg_template(name, bin_buf, bin_len);
+        if (ok) wifi_now_save_msg_templates();
+    }
+
+    char resp_buf[256];
+    snprintf(resp_buf, sizeof(resp_buf),
+             "{\"success\":%s}",
+             ok ? "true" : "false");
+    httpd_resp_set_type(req, "application/json; charset=utf-8");
+    httpd_resp_send(req, resp_buf, strlen(resp_buf));
+    return ESP_OK;
+}
+
+static esp_err_t api_espnow_template_update_handler(httpd_req_t* req)
+{
+    char buf[1024];
+    int ret = httpd_req_recv(req, buf, sizeof(buf) - 1);
+    if (ret <= 0) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Failed to receive data");
+        return ESP_FAIL;
+    }
+    buf[ret] = '\0';
+
+    int index = -1;
+    char* name = NULL;
+    char* data = NULL;
+    int data_len = 0;
+
+    char* idx_str = strstr(buf, "\"index\"");
+    if (idx_str) {
+        idx_str = strchr(idx_str, ':');
+        if (idx_str) {
+            idx_str++;
+            while (*idx_str && (*idx_str == ' ')) idx_str++;
+            sscanf(idx_str, "%d", &index);
+        }
+    }
+
+    // IMPORTANT: parse 'data' BEFORE 'name' to avoid null-termination corruption
+    char* data_str = strstr(buf, "\"data\"");
+    if (data_str) {
+        data_str = strchr(data_str, ':');
+        if (data_str) {
+            data_str++;
+            while (*data_str && (*data_str == ' ' || *data_str == '"')) data_str++;
+            char* end = strchr(data_str, '"');
+            if (end) {
+                *end = '\0';
+                data = data_str;
+                data_len = strlen(data_str);
+            }
+        }
+    }
+
+    char* name_str = strstr(buf, "\"name\"");
+    if (name_str) {
+        name_str = strchr(name_str, ':');
+        if (name_str) {
+            name_str++;
+            while (*name_str && (*name_str == ' ' || *name_str == '"')) name_str++;
+            char* end = strchr(name_str, '"');
+            if (end) {
+                *end = '\0';
+                name = name_str;
+            }
+        }
+    }
+
+    uint8_t bin_buf[250];
+    int bin_len = 0;
+    if (data && data_len > 0) {
+        bin_len = hex_decode(data, bin_buf, sizeof(bin_buf));
+    }
+
+    bool ok = false;
+    if (index >= 0 && name && bin_len > 0) {
+        ok = wifi_now_update_msg_template(index, name, bin_buf, bin_len);
+        if (ok) wifi_now_save_msg_templates();
+    }
+
+    char resp_buf[256];
+    snprintf(resp_buf, sizeof(resp_buf),
+             "{\"success\":%s}",
+             ok ? "true" : "false");
+    httpd_resp_set_type(req, "application/json; charset=utf-8");
+    httpd_resp_send(req, resp_buf, strlen(resp_buf));
+    return ESP_OK;
+}
+
+static esp_err_t api_espnow_template_remove_handler(httpd_req_t* req)
+{
+    char buf[256];
+    int ret = httpd_req_recv(req, buf, sizeof(buf) - 1);
+    if (ret <= 0) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Failed to receive data");
+        return ESP_FAIL;
+    }
+    buf[ret] = '\0';
+
+    int index = -1;
+    char* idx_str = strstr(buf, "\"index\"");
+    if (idx_str) {
+        idx_str = strchr(idx_str, ':');
+        if (idx_str) {
+            idx_str++;
+            while (*idx_str && (*idx_str == ' ')) idx_str++;
+            sscanf(idx_str, "%d", &index);
+        }
+    }
+
+    bool ok = false;
+    if (index >= 0) {
+        ok = wifi_now_remove_msg_template(index);
+        if (ok) wifi_now_save_msg_templates();
+    }
+
+    char resp_buf[256];
+    snprintf(resp_buf, sizeof(resp_buf),
+             "{\"success\":%s}",
+             ok ? "true" : "false");
+    httpd_resp_set_type(req, "application/json; charset=utf-8");
+    httpd_resp_send(req, resp_buf, strlen(resp_buf));
+    return ESP_OK;
+}
+
+static esp_err_t api_espnow_send_template_handler(httpd_req_t* req)
+{
+    char buf[1024];
+    int ret = httpd_req_recv(req, buf, sizeof(buf) - 1);
+    if (ret <= 0) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Failed to receive data");
+        return ESP_FAIL;
+    }
+    buf[ret] = '\0';
+
+    int index = -1;
+    bool is_broadcast = false;
+    uint8_t mac[6] = {0};
+
+    char* idx_str = strstr(buf, "\"index\"");
+    if (idx_str) {
+        idx_str = strchr(idx_str, ':');
+        if (idx_str) {
+            idx_str++;
+            while (*idx_str && (*idx_str == ' ')) idx_str++;
+            sscanf(idx_str, "%d", &index);
+        }
+    }
+
+    char* bcast_str = strstr(buf, "\"broadcast\"");
+    if (bcast_str) {
+        is_broadcast = strstr(bcast_str, "true") != NULL;
+    }
+
+    char* mac_str = strstr(buf, "\"mac\"");
+    if (mac_str && !is_broadcast) {
+        mac_str = strchr(mac_str, ':');
+        if (mac_str) {
+            mac_str++;
+            while (*mac_str && (*mac_str == ' ' || *mac_str == '"')) mac_str++;
+            int vals[6];
+            if (sscanf(mac_str, "%x:%x:%x:%x:%x:%x",
+                       &vals[0], &vals[1], &vals[2],
+                       &vals[3], &vals[4], &vals[5]) == 6) {
+                for (int i = 0; i < 6; i++) mac[i] = (uint8_t)vals[i];
+            }
+        }
+    }
+
+    bool ok = false;
+    if (index >= 0) {
+        wifi_now_msg_template_t tmpl;
+        if (wifi_now_get_msg_template(index, &tmpl)) {
+            if (is_broadcast) {
+                int sent = wifi_now_broadcast(tmpl.data, tmpl.data_len);
+                ok = sent == 0;
+            } else if (mac[0] || mac[1] || mac[2] || mac[3] || mac[4] || mac[5]) {
+                int sent = wifi_now_send(mac, tmpl.data, tmpl.data_len);
+                ok = sent == 0;
+            }
+        }
+    }
+
+    char resp_buf[256];
+    snprintf(resp_buf, sizeof(resp_buf),
+             "{\"success\":%s}",
+             ok ? "true" : "false");
+    httpd_resp_set_type(req, "application/json; charset=utf-8");
+    httpd_resp_send(req, resp_buf, strlen(resp_buf));
+    return ESP_OK;
+}
+
+static esp_err_t api_espnow_send_templates_handler(httpd_req_t* req)
+{
+    char buf[2048];
+    int ret = httpd_req_recv(req, buf, sizeof(buf) - 1);
+    if (ret <= 0) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Failed to receive data");
+        return ESP_FAIL;
+    }
+    buf[ret] = '\0';
+
+    bool is_broadcast = false;
+    uint8_t mac[6] = {0};
+    int indexes[ESP_NOW_MAX_MSG_TEMPLATES];
+    int index_count = 0;
+
+    char* bcast_str = strstr(buf, "\"broadcast\"");
+    if (bcast_str) {
+        is_broadcast = strstr(bcast_str, "true") != NULL;
+    }
+
+    char* mac_str = strstr(buf, "\"mac\"");
+    if (mac_str && !is_broadcast) {
+        mac_str = strchr(mac_str, ':');
+        if (mac_str) {
+            mac_str++;
+            while (*mac_str && (*mac_str == ' ' || *mac_str == '"')) mac_str++;
+            int vals[6];
+            if (sscanf(mac_str, "%x:%x:%x:%x:%x:%x",
+                       &vals[0], &vals[1], &vals[2],
+                       &vals[3], &vals[4], &vals[5]) == 6) {
+                for (int i = 0; i < 6; i++) mac[i] = (uint8_t)vals[i];
+            }
+        }
+    }
+
+    char* indexes_str = strstr(buf, "\"indexes\"");
+    if (indexes_str) {
+        indexes_str = strchr(indexes_str, '[');
+        if (indexes_str) {
+            indexes_str++;
+            char* end = strchr(indexes_str, ']');
+            if (end) {
+                *end = '\0';
+                char* token = strtok(indexes_str, ",");
+                while (token && index_count < ESP_NOW_MAX_MSG_TEMPLATES) {
+                    while (*token && (*token == ' ' || *token == '"')) token++;
+                    indexes[index_count++] = atoi(token);
+                    token = strtok(NULL, ",");
+                }
+            }
+        }
+    }
+
+    int sent_count = 0;
+    for (int i = 0; i < index_count; i++) {
+        wifi_now_msg_template_t tmpl;
+        if (wifi_now_get_msg_template(indexes[i], &tmpl)) {
+            int sent = 0;
+            if (is_broadcast) {
+                sent = wifi_now_broadcast(tmpl.data, tmpl.data_len);
+            } else if (mac[0] || mac[1] || mac[2] || mac[3] || mac[4] || mac[5]) {
+                sent = wifi_now_send(mac, tmpl.data, tmpl.data_len);
+            }
+            if (sent == 0) sent_count++;
+            vTaskDelay(pdMS_TO_TICKS(10));
+        }
+    }
+
+    char resp_buf[256];
+    snprintf(resp_buf, sizeof(resp_buf),
+             "{\"success\":%s,\"sent\":%d}",
+             sent_count == index_count ? "true" : "false",
+             sent_count);
+    httpd_resp_set_type(req, "application/json; charset=utf-8");
+    httpd_resp_send(req, resp_buf, strlen(resp_buf));
+    return ESP_OK;
+}
+
+static esp_err_t api_espnow_messages_handler(httpd_req_t* req)
+{
+    char* buf = (char*)malloc(4096);
+    if (!buf) {
+        httpd_resp_send_500(req);
+        return ESP_FAIL;
+    }
+    wifi_now_get_recv_messages_json(buf, 4096);
+    httpd_resp_set_type(req, "application/json; charset=utf-8");
+    httpd_resp_send(req, buf, strlen(buf));
+    free(buf);
+    return ESP_OK;
+}
+
+static esp_err_t api_espnow_send_history_handler(httpd_req_t* req)
+{
+    char* buf = (char*)malloc(2048);
+    if (!buf) {
+        httpd_resp_send_500(req);
+        return ESP_FAIL;
+    }
+    wifi_now_get_send_history_json(buf, 2048);
+    httpd_resp_set_type(req, "application/json; charset=utf-8");
+    httpd_resp_send(req, buf, strlen(buf));
+    free(buf);
+    return ESP_OK;
+}
+
+// ==================== Role Control API ====================
+
+static esp_err_t api_espnow_role_handler(httpd_req_t* req)
+{
+    if (req->method == HTTP_GET) {
+        char buf[64];
+        snprintf(buf, sizeof(buf),
+                 "{\"role\":%d}", (int)role_control_get_role());
+        httpd_resp_set_type(req, "application/json; charset=utf-8");
+        httpd_resp_send(req, buf, strlen(buf));
+        return ESP_OK;
+    }
+
+    char buf[128] = {0};
+    int ret = httpd_req_recv(req, buf, sizeof(buf) - 1);
+    if (ret <= 0) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Failed to receive data");
+        return ESP_FAIL;
+    }
+    buf[ret] = '\0';
+
+    int role_val = 0;
+    char* role_str = strstr(buf, "\"role\"");
+    if (role_str) {
+        role_str = strchr(role_str, ':');
+        if (role_str) {
+            role_str++;
+            while (*role_str && (*role_str == ' ')) role_str++;
+            role_val = atoi(role_str);
+        }
+    }
+
+    role_control_set_role((role_type_t)role_val);
+
+    char resp[64];
+    snprintf(resp, sizeof(resp), "{\"success\":true,\"role\":%d}", role_val);
+    httpd_resp_set_type(req, "application/json; charset=utf-8");
+    httpd_resp_send(req, resp, strlen(resp));
+    ESP_LOGI(TAG, "Role set to %d via API", role_val);
+    return ESP_OK;
+}
+
+static esp_err_t api_espnow_role_status_handler(httpd_req_t* req)
+{
+    char buf[128];
+    snprintf(buf, sizeof(buf),
+             "{\"role\":%d,\"state\":\"%s\",\"remaining\":%d,\"peers\":%d}",
+             (int)role_control_get_role(),
+             role_control_get_state() == ROLE_STATE_ACTIVE ? "ACTIVE" : "IDLE",
+             role_control_get_remaining(),
+             role_control_get_peer_count());
+    httpd_resp_set_type(req, "application/json; charset=utf-8");
+    httpd_resp_send(req, buf, strlen(buf));
+    return ESP_OK;
+}
+
+static esp_err_t api_espnow_role_start_handler(httpd_req_t* req)
+{
+    bool ok = role_control_start();
+    char buf[64];
+    snprintf(buf, sizeof(buf), "{\"success\":%s}", ok ? "true" : "false");
+    httpd_resp_set_type(req, "application/json; charset=utf-8");
+    httpd_resp_send(req, buf, strlen(buf));
+    ESP_LOGI(TAG, "Role start via API: %s", ok ? "OK" : "FAIL");
+    return ESP_OK;
+}
+
+static esp_err_t api_espnow_role_stop_handler(httpd_req_t* req)
+{
+    role_control_stop();
+    httpd_resp_set_type(req, "application/json; charset=utf-8");
+    httpd_resp_send(req, "{\"success\":true}", HTTPD_RESP_USE_STRLEN);
+    ESP_LOGI(TAG, "Role stop via API");
+    return ESP_OK;
+}
+
+static esp_err_t api_system_hwinfo_handler(httpd_req_t* req)
+{
+    char buf[1536];
+    char pmk_hex[33] = {0};
+
+    // PMK 转 HEX 字符串
+    const uint8_t* pmk = wifi_now_get_pmk();
+    for (int i = 0; i < 16; i++) {
+        sprintf(pmk_hex + i * 2, "%02X", pmk[i]);
+    }
+
+    esp_chip_info_t chip;
+    esp_chip_info(&chip);
+
+    int cores = chip.cores;
+    int revision = chip.revision;
+    int cpu_freq_mhz = CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ;
+
+    uint32_t flash_size = 0;
+    esp_flash_get_size(NULL, &flash_size);
+
+    size_t psram_size = heap_caps_get_total_size(MALLOC_CAP_SPIRAM);
+
+    size_t heap_total = heap_caps_get_total_size(MALLOC_CAP_INTERNAL);
+    size_t heap_free = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+    size_t heap_min_free = esp_get_minimum_free_heap_size();
+
+    uint32_t app_size = 0;
+    const esp_partition_t* app_part = esp_partition_find_first(ESP_PARTITION_TYPE_APP, ESP_PARTITION_SUBTYPE_ANY, NULL);
+    if (app_part) {
+        app_size = app_part->size;
+    }
+
+    snprintf(buf, sizeof(buf),
+             "{"
+             "\"chip\":\"%s\","
+             "\"cores\":%d,"
+             "\"revision\":%d,"
+             "\"cpu_freq\":%d,"
+             "\"flash_size\":%u,"
+             "\"psram_size\":%u,"
+             "\"heap_total\":%u,"
+             "\"heap_free\":%u,"
+             "\"heap_min_free\":%u,"
+             "\"app_size\":%u,"
+             "\"pmk\":\"%s\","
+             "\"version\":\"%s\""
+             "}",
+             "ESP32-S3", cores, revision, cpu_freq_mhz,
+             (unsigned)flash_size, (unsigned)psram_size,
+             (unsigned)heap_total, (unsigned)heap_free, (unsigned)heap_min_free,
+             (unsigned)app_size,
+             pmk_hex, "1.0.0");
+
+    httpd_resp_set_type(req, "application/json; charset=utf-8");
     httpd_resp_send(req, buf, strlen(buf));
     return ESP_OK;
 }
@@ -1646,7 +2768,7 @@ void web_server_start(WebServer* ws)
 {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.server_port      = 80;
-    config.max_uri_handlers = 24;
+    config.max_uri_handlers = 39;
     config.stack_size       = 16384;
 
     httpd_uri_t root_uri     = { .uri = "/", .method = HTTP_GET, .handler = root_get_handler, .user_ctx = NULL };
@@ -1663,6 +2785,8 @@ void web_server_start(WebServer* ws)
     httpd_uri_t ble_scan_uri   = { .uri = "/api/ble/scan", .method = HTTP_POST, .handler = api_ble_scan_handler, .user_ctx = NULL };
     httpd_uri_t ble_dev_uri    = { .uri = "/api/ble/devices", .method = HTTP_GET, .handler = api_ble_devices_handler, .user_ctx = NULL };
     httpd_uri_t ble_pair_uri   = { .uri = "/api/ble/pair", .method = HTTP_POST, .handler = api_ble_pair_handler, .user_ctx = NULL };
+    httpd_uri_t ble_name_get_uri = { .uri = "/api/ble/name", .method = HTTP_GET, .handler = api_ble_name_get_handler, .user_ctx = NULL };
+    httpd_uri_t ble_name_set_uri = { .uri = "/api/ble/name", .method = HTTP_POST, .handler = api_ble_name_set_handler, .user_ctx = NULL };
     httpd_uri_t now_peers_uri  = { .uri = "/api/now/peers", .method = HTTP_GET, .handler = api_now_peers_handler, .user_ctx = NULL };
     httpd_uri_t now_rm_uri     = { .uri = "/api/now/peer/remove", .method = HTTP_POST, .handler = api_now_peer_remove_handler, .user_ctx = NULL };
     httpd_uri_t now_mac_uri    = { .uri = "/api/now/mac", .method = HTTP_GET, .handler = api_now_mac_handler, .user_ctx = NULL };
@@ -1671,6 +2795,20 @@ void web_server_start(WebServer* ws)
     httpd_uri_t espnow_unpair_uri = { .uri = "/api/espnow/unpair", .method = HTTP_POST, .handler = api_espnow_unpair_handler, .user_ctx = NULL };
     httpd_uri_t espnow_send_uri = { .uri = "/api/espnow/send", .method = HTTP_POST, .handler = api_espnow_send_handler, .user_ctx = NULL };
     httpd_uri_t espnow_broadcast_uri = { .uri = "/api/espnow/broadcast", .method = HTTP_POST, .handler = api_espnow_broadcast_handler, .user_ctx = NULL };
+    httpd_uri_t espnow_templates_uri = { .uri = "/api/espnow/templates", .method = HTTP_GET, .handler = api_espnow_templates_get_handler, .user_ctx = NULL };
+    httpd_uri_t espnow_template_add_uri = { .uri = "/api/espnow/templates/add", .method = HTTP_POST, .handler = api_espnow_template_add_handler, .user_ctx = NULL };
+    httpd_uri_t espnow_template_update_uri = { .uri = "/api/espnow/templates/update", .method = HTTP_POST, .handler = api_espnow_template_update_handler, .user_ctx = NULL };
+    httpd_uri_t espnow_template_remove_uri = { .uri = "/api/espnow/templates/remove", .method = HTTP_POST, .handler = api_espnow_template_remove_handler, .user_ctx = NULL };
+    httpd_uri_t espnow_send_template_uri = { .uri = "/api/espnow/send/template", .method = HTTP_POST, .handler = api_espnow_send_template_handler, .user_ctx = NULL };
+    httpd_uri_t espnow_send_templates_uri = { .uri = "/api/espnow/send/templates", .method = HTTP_POST, .handler = api_espnow_send_templates_handler, .user_ctx = NULL };
+    httpd_uri_t espnow_messages_uri = { .uri = "/api/espnow/messages", .method = HTTP_GET, .handler = api_espnow_messages_handler, .user_ctx = NULL };
+    httpd_uri_t espnow_send_history_uri = { .uri = "/api/espnow/send/history", .method = HTTP_GET, .handler = api_espnow_send_history_handler, .user_ctx = NULL };
+    httpd_uri_t role_uri       = { .uri = "/api/espnow/role", .method = HTTP_GET, .handler = api_espnow_role_handler, .user_ctx = NULL };
+    httpd_uri_t role_set_uri   = { .uri = "/api/espnow/role", .method = HTTP_POST, .handler = api_espnow_role_handler, .user_ctx = NULL };
+    httpd_uri_t role_status_uri = { .uri = "/api/espnow/role/status", .method = HTTP_GET, .handler = api_espnow_role_status_handler, .user_ctx = NULL };
+    httpd_uri_t role_start_uri = { .uri = "/api/espnow/role/start", .method = HTTP_POST, .handler = api_espnow_role_start_handler, .user_ctx = NULL };
+    httpd_uri_t role_stop_uri  = { .uri = "/api/espnow/role/stop", .method = HTTP_POST, .handler = api_espnow_role_stop_handler, .user_ctx = NULL };
+    httpd_uri_t hwinfo_uri     = { .uri = "/api/system/hwinfo", .method = HTTP_GET, .handler = api_system_hwinfo_handler, .user_ctx = NULL };
 
     if (httpd_start(&ws->server, &config) == ESP_OK) {
         httpd_register_uri_handler(ws->server, &root_uri);
@@ -1687,6 +2825,8 @@ void web_server_start(WebServer* ws)
         httpd_register_uri_handler(ws->server, &ble_scan_uri);
         httpd_register_uri_handler(ws->server, &ble_dev_uri);
         httpd_register_uri_handler(ws->server, &ble_pair_uri);
+        httpd_register_uri_handler(ws->server, &ble_name_get_uri);
+        httpd_register_uri_handler(ws->server, &ble_name_set_uri);
         httpd_register_uri_handler(ws->server, &now_peers_uri);
         httpd_register_uri_handler(ws->server, &now_rm_uri);
         httpd_register_uri_handler(ws->server, &now_mac_uri);
@@ -1695,6 +2835,20 @@ void web_server_start(WebServer* ws)
         httpd_register_uri_handler(ws->server, &espnow_unpair_uri);
         httpd_register_uri_handler(ws->server, &espnow_send_uri);
         httpd_register_uri_handler(ws->server, &espnow_broadcast_uri);
+        httpd_register_uri_handler(ws->server, &espnow_templates_uri);
+        httpd_register_uri_handler(ws->server, &espnow_template_add_uri);
+        httpd_register_uri_handler(ws->server, &espnow_template_update_uri);
+        httpd_register_uri_handler(ws->server, &espnow_template_remove_uri);
+        httpd_register_uri_handler(ws->server, &espnow_send_template_uri);
+        httpd_register_uri_handler(ws->server, &espnow_send_templates_uri);
+        httpd_register_uri_handler(ws->server, &espnow_messages_uri);
+        httpd_register_uri_handler(ws->server, &espnow_send_history_uri);
+        httpd_register_uri_handler(ws->server, &role_uri);
+        httpd_register_uri_handler(ws->server, &role_set_uri);
+        httpd_register_uri_handler(ws->server, &role_status_uri);
+        httpd_register_uri_handler(ws->server, &role_start_uri);
+        httpd_register_uri_handler(ws->server, &role_stop_uri);
+        httpd_register_uri_handler(ws->server, &hwinfo_uri);
         ESP_LOGI(TAG, "Web server started on port 80");
 
         wifi_service_set_ap_client_callback(ap_client_connected_cb, NULL);

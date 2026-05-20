@@ -11,6 +11,8 @@
 #include "web_server.h"
 #include "ble_pairing.h"
 #include "wifi_now.h"
+#include "role_control.h"
+#include "led_indicator.h"
 
 static const char* TAG = "MAIN";
 
@@ -41,6 +43,12 @@ extern "C" void app_main(void)
     ESP_LOGI(TAG, "Step 4: BLE Pairing init...");
     ble_pairing_init();
 
+    ESP_LOGI(TAG, "Step 4b: LED Indicator init...");
+    led_indicator_init();
+
+    ESP_LOGI(TAG, "Step 4c: Role Control init...");
+    role_control_init();
+
     ESP_LOGI(TAG, "Step 5: USB reconnect...");
     usb_network_reconnect();
 
@@ -69,6 +77,12 @@ extern "C" void app_main(void)
         ESP_LOGI(TAG, "AP-only mode active");
     } else if (mode == WIFI_OP_MODE_APSTA) {
         ESP_LOGI(TAG, "AP+STA dual mode active");
+    }
+
+    // 自动启动角色动作
+    if (role_control_get_role() != ROLE_OFF) {
+        ESP_LOGI(TAG, "Role is configured, auto-starting...");
+        role_control_start();
     }
 
     ESP_LOGI(TAG, "========================================");

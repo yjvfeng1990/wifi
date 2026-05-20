@@ -18,6 +18,7 @@
 #include "lwip/tcpip.h"
 #include "wifi_service.h"
 #include "usb_network.h"
+#include "wifi_now.h"
 
 static const char* TAG = "WIFI_SRV";
 static const char* NVS_NAMESPACE = "wifi_cfg";
@@ -425,6 +426,8 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base,
         case WIFI_EVENT_STA_CONNECTED:
             ESP_LOGI(TAG, "WiFi STA connected");
             update_rssi();
+            // STA 连接可能导致信道变化，同步更新 ESP-NOW 所有 peer 的信道
+            wifi_now_update_peers_channel(wifi_now_get_channel());
             break;
 
         case WIFI_EVENT_STA_DISCONNECTED: {

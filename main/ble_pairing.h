@@ -24,6 +24,8 @@ typedef struct {
     uint8_t now_mac[6];
     char    name[BLE_DEV_NAME_MAX];
     int     rssi;
+    uint8_t channel;
+    uint8_t peer_type;
 } ble_discovered_device_t;
 
 void ble_pairing_init(void);
@@ -33,6 +35,9 @@ ble_pair_state_t ble_pairing_get_state(void);
 bool ble_pairing_start_advertise(const char* device_name);
 void ble_pairing_stop_advertise(void);
 bool ble_pairing_is_advertising(void);
+bool ble_pairing_start_adv_burst(const char* device_name, uint8_t duration_sec);
+void ble_pairing_stop_adv_burst(void);
+bool ble_pairing_is_burst_mode(void);
 
 bool ble_pairing_start_scan(uint8_t duration_sec);
 void ble_pairing_stop_scan(void);
@@ -47,6 +52,7 @@ bool ble_pairing_get_auto_pair(void);
 uint8_t* ble_pairing_get_own_now_mac(void);
 
 void ble_pairing_get_name(char* name_out);
+bool ble_pairing_set_name(const char* name);
 
 #ifdef __cplusplus
 }
