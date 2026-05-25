@@ -326,7 +326,10 @@ static void post_scan_timer_callback(TimerHandle_t timer)
 
     // 扫描完全停止后的处理逻辑
     // 如果发现设备少于 2 个且还有补扫机会，先复位 BLE controller 再启动补扫
-    if (s_discovered_count < 2 && s_scan_retries < MAX_SCAN_RETRIES) {
+    // 关键：必须检查 activity timer 是否已过期（remaining==0），
+    // 否则在 60 秒计时器触发停止扫描后，补扫又会重新启动 BLE 扫描
+    if (s_discovered_count < 2 && s_scan_retries < MAX_SCAN_RETRIES
+        && role_control_get_remaining() > 0) {
         s_scan_retries++;
         ESP_LOGI(TAG, "=== RETRY %d/%d: only %d device(s), "
                  "resetting BLE controller + %ds supplementary scan ===",

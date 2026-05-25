@@ -2,8 +2,8 @@
 
 ## 快速参考
 
-**文档版本**: 3.0  
-**更新日期**: 2026-05-18  
+**文档版本**: 4.0  
+**更新日期**: 2026-05-25  
 **目标平台**: ESP32-S3 (ESP-IDF v6.0.1)
 
 ---
@@ -32,7 +32,10 @@
 | 0 | 2 | 厂商ID | `0x02E5` (乐鑫) |
 | 2 | 2 | 协议标记 | `"EN"` (0x45, 0x4E) |
 | 4 | 6 | ESP-NOW MAC | 设备的WiFi MAC地址 |
-| 10+ | N | 设备名称 | UTF-8编码的设备名称 |
+| 10 | 1 | 版本号 | 协议版本 (当前为1) |
+| 11 | 1 | 信道 | 设备当前WiFi信道 |
+| 12 | 1 | 节点类型 | `0`=WiFi, `1`=ESP-NOW |
+| 13+ | N | 设备名称 | UTF-8编码设备名称 (最多19字节) |
 
 ### 关键常量
 
@@ -54,6 +57,18 @@
 // 解绑消息 (v3.0)
 #define ESP_NOW_MSG_UNPAIR_REQUEST   0x03       // 解绑请求
 #define ESP_NOW_MSG_UNPAIR_RESPONSE  0x04       // 解绑响应
+
+// 节点类型 (v4.0)
+#define PEER_TYPE_WIFI            0          // WiFi节点
+#define PEER_TYPE_ESPNOW          1          // ESP-NOW节点
+
+// 扩展消息类型 (v4.0)
+#define ESP_NOW_MSG_UNBIND_ALL    0x06       // 一键解绑所有节点
+#define ESP_NOW_MSG_ACK           0x05       // 应用层ACK确认
+
+// 扫描补扫参数 (v4.0)
+#define MAX_SCAN_RETRIES          3          // 最大补扫次数
+#define RETRY_SCAN_DURATION       30         // 每次补扫持续时间(秒)
 ```
 
 ---
@@ -63,11 +78,16 @@
 ```c
 // 配对消息结构
 typedef struct {
-    uint32_t magic;        // 0x4553504E ("ESPN")
-    uint8_t  type;         // PAIR_REQUEST (0x01) 或 PAIR_RESPONSE (0x02)
-    uint8_t  mac[6];       // 发送者的ESP-NOW MAC
-    char     name[32];      // 设备名称 (null结尾)
+    uint32_t magic;          // 0x4553504E ("ESPN")
+    uint8_t  type;           // 消息类型 (0x01-0x06, 0x10)
+    uint8_t  mac[6];         // 发送者的ESP-NOW MAC
+    uint8_t  channel;        // 发送者当前WiFi信道
+    uint8_t  peer_type;      // 节点类型 (PEER_TYPE_WIFI=0, PEER_TYPE_ESPNOW=1)
+    char     name[32];       // 设备名称
+    uint8_t  pmk[16];        // 自动生成的PMK，用于对端同步
 } __attribute__((packed)) esp_now_pair_msg_t;
+
+// 大小说明：该结构体当前为 63 字节。
 ```
 
 ### 消息类型
@@ -76,8 +96,10 @@ typedef struct {
 |------|-----|------|
 | PAIR_REQUEST | 0x01 | 请求添加发送者为peer |
 | PAIR_RESPONSE | 0x02 | 响应接受peer添加 |
-| UNPAIR_REQUEST | 0x03 | 请求解绑，删除发送者 (v3.0) |
-| UNPAIR_RESPONSE | 0x04 | 响应解绑确认 (v3.0) |
+| UNPAIR_REQUEST | 0x03 | 请求解绑 |
+| UNPAIR_RESPONSE | 0x04 | 响应解绑确认 |
+| ACK | 0x05 | 应用层ACK确认 |
+| UNBIND_ALL | 0x06 | 一键解绑所有节点 (v4.0) |
 | DATA | 0x10 | 常规数据消息 |
 
 ---
@@ -432,12 +454,24 @@ bool wifi_now_unpair_with_peer(const uint8_t* mac_addr) {
 - **可以添加多个广播端为peer**
 - 发现广播端时发送PAIR_REQUEST
 - 接收并处理PAIR_RESPONSE消息
+- 开机自动启动 60s BLE 扫描，之后通过 START/STOP 按钮手动控制
 
 **广播端角色 (BLE广播)**
 - 发送BLE广播包
 - **只添加扫描端为peer**（不添加其他广播端）
 - 收到PAIR_REQUEST后添加发送者为peer
 - 发送PAIR_RESPONSE
+- 开机自动启动 60s BLE 广播，之后通过 START/STOP 按钮手动控制
+
+**角色控制行为 (v2.1)**
+
+| 触发方式 | 行为 | 说明 |
+|----------|------|------|
+| 开机 | 自动启动 BLE，60s 后停止 | MASTER 扫描 / SLAVE 广播 |
+| START 按钮 | 启动/重置 BLE，新 60s 倒计时 | 已运行时仅重置计时器 |
+| STOP 按钮 | 立即停止 BLE，state=IDLE | LED 关闭，remaining=0 |
+| GPIO4 拉低 | 触发 START 行为 | 防抖 300ms |
+| 60s 到期 | 自动停止 BLE，state=IDLE | 角色保持不变，ESP-NOW 继续工作 |
 
 ---
 
@@ -446,7 +480,7 @@ bool wifi_now_unpair_with_peer(const uint8_t* mac_addr) {
 | 参数 | 值 | 描述 |
 |------|------|------|
 | 广播类型 | 扩展广播 | Legacy Indication |
-| 广播间隔 | 100ms (160) | 每100ms广播一次 |
+| 广播间隔 | 100~125ms (160~200) | 每100~125ms广播一次 |
 | 信道映射 | 0x07 | 使用全部3个信道 |
 | 主PHY | 1M | 1Mbps物理层 |
 | 次PHY | 1M | 1Mbps物理层 |
@@ -458,10 +492,10 @@ bool wifi_now_unpair_with_peer(const uint8_t* mac_addr) {
 | 参数 | 值 | 描述 |
 |------|------|------|
 | 扫描类型 | 主动扫描 | Active Scan |
-| 扫描间隔 | 50ms (80) | 扫描间隔 |
-| 扫描窗口 | 30ms (48) | 扫描窗口大小 |
-| 默认扫描时长 | 10秒 | 自动停止时间 |
-| 重复过滤 | 禁用 | 报告所有设备 |
+| 扫描间隔 | 100ms (160) | 扫描间隔 |
+| 扫描窗口 | 50ms (80) | 扫描窗口大小 |
+| 默认扫描时长 | 60秒（可通过API配置） | 自动停止时间 |
+| 重复过滤 | 启用 | `BLE_SCAN_DUPLICATE_ENABLE` |
 
 ---
 
@@ -484,7 +518,9 @@ typedef struct {
     uint8_t mac[6];       // BLE MAC地址
     uint8_t now_mac[6];   // ESP-NOW MAC地址
     char    name[32];     // 设备名称
-    int     rssi;          // 信号强度
+    int     rssi;         // 信号强度
+    uint8_t channel;      // 对方WiFi信道 (v4.0)
+    uint8_t peer_type;    // 节点类型 (v4.0)
 } ble_discovered_device_t;
 
 // ESP-NOW节点信息
@@ -492,6 +528,7 @@ typedef struct {
     uint8_t mac[6];       // 节点MAC地址
     int     channel;      // WiFi信道
     char    name[32];     // 节点名称
+    uint8_t peer_type;    // 节点类型 (v4.0)
 } wifi_now_peer_info_t;
 
 // 配对消息结构 (v2.0)
@@ -529,7 +566,7 @@ typedef void (*wifi_now_send_cb_t)(const uint8_t* mac_addr, bool success);
 | `ble_pairing_start_advertise(name)` | 开始BLE广播 |
 | `ble_pairing_stop_advertise()` | 停止BLE广播 |
 | `ble_pairing_is_advertising()` | 检查是否正在广播 |
-| `ble_pairing_start_scan(sec)` | 开始BLE扫描（自动配对） |
+| `ble_pairing_start_scan(sec)` | 开始BLE扫描（自动配对，sec为uint16_t） |
 | `ble_pairing_stop_scan()` | 停止BLE扫描 |
 | `ble_pairing_is_scanning()` | 检查是否正在扫描 |
 | `ble_pairing_get_discovered(devs, max)` | 获取发现的设备列表 |
@@ -538,6 +575,12 @@ typedef void (*wifi_now_send_cb_t)(const uint8_t* mac_addr, bool success);
 | `ble_pairing_get_auto_pair()` | 获取自动配对状态 (v2.0) |
 | `ble_pairing_get_own_now_mac()` | 获取本机ESP-NOW MAC |
 | `ble_pairing_get_name(name_out)` | 获取本机设备名称 (v2.0) |
+| `ble_pairing_get_state()` | 获取当前BLE状态 (v4.0) |
+| `ble_pairing_start_adv_burst(name, sec)` | 开始限时广播模式 (v4.0) |
+| `ble_pairing_stop_adv_burst()` | 停止限时广播模式 (v4.0) |
+| `ble_pairing_is_burst_mode()` | 检查是否在限时广播模式 (v4.0) |
+| `ble_pairing_set_name(name)` | 设置并持久化BLE设备名 (v4.0) |
+| `ble_pairing_reset_controller()` | 硬复位BLE控制器 (v4.0) |
 
 ### ESP-NOW函数
 
@@ -547,7 +590,7 @@ typedef void (*wifi_now_send_cb_t)(const uint8_t* mac_addr, bool success);
 | `wifi_now_deinit()` | 关闭ESP-NOW |
 | `wifi_now_is_initialized()` | 检查是否已初始化 |
 | `wifi_now_add_peer(mac, ch)` | 添加节点 |
-| `wifi_now_add_peer_with_name(mac, ch, name)` | 添加节点（带名称） |
+| `wifi_now_add_peer_with_name(mac, ch, name, peer_type)` | 添加节点（带名称和节点类型） |
 | `wifi_now_remove_peer(mac)` | 移除节点 |
 | `wifi_now_get_peer_count()` | 获取节点数量 |
 | `wifi_now_is_peer_exists(mac)` | 检查节点是否存在 |
@@ -572,6 +615,26 @@ typedef void (*wifi_now_send_cb_t)(const uint8_t* mac_addr, bool success);
 | `wifi_now_handle_unpair_message(mac, data, len)` | 处理解绑消息 (v3.0) |
 | `wifi_now_unpair_with_peer(mac)` | 解绑指定节点 (v3.0) |
 | `wifi_now_set_unpair_callback(cb)` | 设置解绑回调 (v3.0) |
+| `wifi_now_get_state()` | 获取ESP-NOW状态 (v4.0) |
+| `wifi_now_is_peer_cached(mac)` | 检查NVS中是否存在peer (v4.0) |
+| `wifi_now_get_pmk()` | 获取本机PMK指针 (v4.0) |
+| `wifi_now_unbind_all()` | 一键解绑所有节点 (v4.0) |
+| `wifi_now_update_peers_channel(ch)` | 更新所有peer的信道 (v4.0) |
+| `wifi_now_format_peer_entry(idx, buf, size, comma)` | 格式化单个peer为JSON (v4.0) |
+| `wifi_now_add_msg_template(name, data, len)` | 添加消息模板 (v4.0) |
+| `wifi_now_update_msg_template(idx, name, data, len)` | 更新消息模板 (v4.0) |
+| `wifi_now_remove_msg_template(idx)` | 删除消息模板 (v4.0) |
+| `wifi_now_get_msg_template_count()` | 获取模板数量 (v4.0) |
+| `wifi_now_get_msg_template(idx, out)` | 获取模板内容 (v4.0) |
+| `wifi_now_format_msg_template(idx, buf, size, comma)` | 格式化模板为JSON (v4.0) |
+| `wifi_now_get_msg_templates_json(buf, size)` | 获取模板列表JSON (v4.0) |
+| `wifi_now_save_msg_templates()` | 保存模板到NVS (v4.0) |
+| `wifi_now_load_msg_templates()` | 从NVS加载模板 (v4.0) |
+| `wifi_now_add_recv_entry(mac, data, len)` | 添加接收历史条目 (v4.0) |
+| `wifi_now_get_recv_count()` | 获取接收历史条数 (v4.0) |
+| `wifi_now_get_recv_messages_json(buf, size)` | 获取接收历史JSON (v4.0) |
+| `wifi_now_get_send_history_count()` | 获取发送历史条数 (v4.0) |
+| `wifi_now_get_send_history_json(buf, size)` | 获取发送历史JSON (v4.0) |
 
 ---
 
@@ -595,6 +658,16 @@ bool auto_pair = ble_pairing_get_auto_pair();
 - **默认状态**: 自动配对是启用的
 - **启用时**: 扫描发现设备后自动添加到peer，无需手动操作
 - **禁用时**: 需要手动调用 `ble_pairing_pair_with_device()` 进行配对
+
+### 扫描补扫机制 (v4.0)
+
+ESP32-S3 BLE controller 存在内部状态机问题，在密集 BLE 环境中可能丢失部分设备的广播包。
+本系统实现了自动补扫机制：
+
+- 扫描结束后若发现设备少于 2 个，自动进行补扫（最多 3 次）
+- 每次补扫前执行 BLE controller 硬复位
+- 补扫持续 30 秒，使用被动扫描模式
+- 补扫完成后统一处理发现的设备
 
 ---
 
@@ -684,6 +757,7 @@ bool auto_pair = ble_pairing_get_auto_pair();
 | 1.0 | 2026-05-17 | 初始版本 |
 | 2.0 | 2026-05-18 | 添加自动配对协议 (v2.0) |
 | 3.0 | 2026-05-18 | 添加退网解绑功能 (v3.0) |
+| 4.0 | 2026-05-25 | 动态PMK同步、广播格式v2、扫描补扫机制、UNBIND_ALL协议、新增API函数 |
 
 ---
 

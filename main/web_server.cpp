@@ -2186,6 +2186,8 @@ static esp_err_t api_espnow_unbind_all_handler(httpd_req_t* req)
         wifi_now_deinit();
         vTaskDelay(pdMS_TO_TICKS(100));
         wifi_now_init();
+        // 二次清空：确保 reinit 后 NVS 或 driver 中没有残留 peer
+        wifi_now_clear_peers();
     }
 
     char buf[128];
@@ -2841,7 +2843,7 @@ static esp_err_t api_espnow_role_handler(httpd_req_t* req)
 
 static esp_err_t api_espnow_role_status_handler(httpd_req_t* req)
 {
-    char buf[160];
+    char buf[256];
     const char* ble_state;
     if (ble_pairing_is_scanning()) {
         ble_state = "SCANNING";
@@ -2851,11 +2853,12 @@ static esp_err_t api_espnow_role_status_handler(httpd_req_t* req)
         ble_state = "IDLE";
     }
     snprintf(buf, sizeof(buf),
-             "{\"role\":%d,\"state\":\"%s\",\"remaining\":%d,\"peers\":%d}",
+             "{\"role\":%d,\"state\":\"%s\",\"remaining\":%d,\"peers\":%d,\"role_state\":%d}",
              (int)role_control_get_role(),
              ble_state,
              role_control_get_remaining(),
-             role_control_get_peer_count());
+             role_control_get_peer_count(),
+             (int)role_control_get_state());
     httpd_resp_set_type(req, "application/json; charset=utf-8");
     httpd_resp_send(req, buf, strlen(buf));
     return ESP_OK;
@@ -2870,45 +2873,22 @@ static esp_err_t api_espnow_role_start_handler(httpd_req_t* req)
         return ESP_OK;
     }
 
-    // Start BLE operations based on role (does not change role state)
-    if (role == ROLE_RECEIVE) {
-        ble_pairing_set_auto_pair(true);
-        ble_pairing_start_scan(60);
-        ESP_LOGI(TAG, "API: BLE scan started (Master)");
-    } else {
-        ble_pairing_set_auto_pair(true);
-        ble_pairing_start_advertise(NULL);
-        ESP_LOGI(TAG, "API: BLE advertise started (Slave)");
-    }
-
-    // Reset display timer so remaining starts from 60s
-    role_control_reset_timer();
+    // 使用 role_control_start() 统一启动: 设置 s_state=ACTIVE + 启动BLE + 启动计时器
+    // 确保倒计时 role_control_get_remaining() 正常返回剩余时间
+    // role_control_start 内部已设置 auto_pair=true
+    bool ok = role_control_start();
 
     httpd_resp_set_type(req, "application/json; charset=utf-8");
-    httpd_resp_send(req, "{\"success\":true}", HTTPD_RESP_USE_STRLEN);
+    char buf[64];
+    snprintf(buf, sizeof(buf), "{\"success\":%s}", ok ? "true" : "false");
+    httpd_resp_send(req, buf, strlen(buf));
     return ESP_OK;
 }
 
 static esp_err_t api_espnow_role_stop_handler(httpd_req_t* req)
 {
-    bool stopped = false;
-    if (ble_pairing_is_scanning()) {
-        ble_pairing_stop_scan();
-        stopped = true;
-        ESP_LOGI(TAG, "API: BLE scan stopped");
-    }
-    if (ble_pairing_is_advertising()) {
-        ble_pairing_stop_advertise();
-        stopped = true;
-        ESP_LOGI(TAG, "API: BLE advertise stopped");
-    }
-    if (ble_pairing_is_burst_mode()) {
-        ble_pairing_stop_adv_burst();
-        stopped = true;
-    }
-    if (!stopped) {
-        ESP_LOGI(TAG, "API: BLE stop (nothing running)");
-    }
+    // 使用 role_control_stop() 统一停止：设置 s_state=IDLE + 停止所有BLE + 停止计时器 + LED关
+    role_control_stop();
 
     httpd_resp_set_type(req, "application/json; charset=utf-8");
     httpd_resp_send(req, "{\"success\":true}", HTTPD_RESP_USE_STRLEN);

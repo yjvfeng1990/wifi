@@ -4,8 +4,8 @@
 
 本文档描述了通过WiFi HTTP API实现ESP-NOW节点自动发现和组网的方法。节点设备通过连接ESP32-S3的AP（热点），使用HTTP请求交换ESP-NOW MAC地址，实现无缝组网。
 
-**文档版本**: 6.0  
-**更新日期**: 2026-05-20  
+**文档版本**: 7.0  
+**更新日期**: 2026-05-25  
 **适用平台**: ESP-IDF v6.0.1 / ESP32-S3
 
 ---
@@ -20,9 +20,12 @@
 6. [消息发送与接收协议](#5-消息发送与接收协议)
 7. [ACK确认协议](#6-ack确认协议)
 8. [消息模板与Web界面](#7-消息模板与web界面)
-9. [实现示例](#8-实现示例)
-10. [错误处理](#9-错误处理)
-11. [其他平台开发指南](#10-其他平台开发指南)
+9. [角色控制模块](#8-角色控制模块-v70) ⚠️ **v7.0**
+10. [实现示例](#9-实现示例)
+11. [错误处理](#10-错误处理)
+12. [其他平台开发指南](#11-其他平台开发指南)
+13. [最佳实践](#12-最佳实践)
+14. [API测试](#13-api测试)
 
 ---
 
@@ -32,18 +35,21 @@
 
 ### 0.1 PMK (Primary Master Key)
 
-本系统 ESP-NOW 使用的 PMK 为固定值：
+本系统 PMK 采用**自动生成 + 动态同步**机制：
 
-```
-PMK: "pmk1234567890123"  (16字节)
-```
+1. **首次启动**：ESP32-S3 生成一个独特的 16 字节 PMK
+   - 前 8 字节：硬件随机数（`esp_fill_random()`）
+   - 后 8 字节：系统启动时间戳（`esp_timer_get_time()`）
+2. **持久化存储**：PMK 自动保存到 NVS，重启后保持不变
+3. **对端同步**：PMK 通过配对消息中的 `pmk[16]` 字段自动同步给对端
+4. **使用方式**：对端在配对过程中自动接收并应用本端的 PMK
 
-**对端必须设置相同的 PMK**，否则消息会被静默丢弃，不会有任何错误提示：
+**对端注意事项：**
+- 对端接收配对消息时，会自动提取 `msg.pmk[16]` 并调用 `esp_now_set_pmk()`
+- 无需手动设置固定 PMK
+- 如果对端需要与本系统以外的设备通信，需注意 PMK 会被配对消息覆盖
 
-```c
-// 对端 ESP-NOW 初始化时必须调用
-esp_now_set_pmk((const uint8_t*)"pmk1234567890123");
-```
+> ⚠️ **重要**：每次配对成功后，双方的 PMK 会统一为发起方（发送 PAIR_REQUEST 的一方）的 PMK。这确保了同一网络内所有设备使用相同的 PMK。
 
 ### 0.2 信道 (Channel)
 
@@ -147,12 +153,45 @@ ESP-NOW是一种高效的点对点WiFi通信协议，但传统的ESP-NOW配对�
 |------|------|------|
 | GET | `/api/espnow/master` | 获取主机的ESP-NOW MAC地址 |
 | POST | `/api/espnow/register` | 节点注册自己的ESP-NOW MAC |
-| POST | `/api/espnow/send` | **发送ESP-NOW数据到指定节点** (v4.0) |
-| POST | `/api/espnow/broadcast` | **广播ESP-NOW数据到所有节点** (v4.0) |
-| POST | `/api/espnow/unpair` | **解绑指定的ESP-NOW节点** (v3.0) |
-| GET | `/api/now/mac` | 获取本机ESP-NOW MAC (BLE) |
+| POST | `/api/espnow/send` | **发送ESP-NOW数据到指定节点** |
+| POST | `/api/espnow/broadcast` | **广播ESP-NOW数据到所有节点** |
+| POST | `/api/espnow/unpair` | **解绑指定的ESP-NOW节点** |
+| POST | `/api/espnow/unbind-all` | **一键解绑所有节点** (v7.0) |
+| GET | `/api/espnow/messages` | **获取接收消息历史** (v7.0) |
+| GET | `/api/espnow/send/history` | **获取发送历史含ACK状态** (v7.0) |
+| GET | `/api/espnow/templates` | 获取消息模板列表 |
+| POST | `/api/espnow/templates/add` | **添加消息模板** (v7.0) |
+| POST | `/api/espnow/templates/update` | 更新消息模板 |
+| POST | `/api/espnow/templates/remove` | **删除消息模板** (v7.0) |
+| POST | `/api/espnow/send/template` | **发送单个模板** (v7.0) |
+| POST | `/api/espnow/send/templates` | **发送多个模板** (v7.0) |
+| GET | `/api/now/mac` | 获取本机ESP-NOW MAC |
 | GET | `/api/now/peers` | 获取已连接的ESP-NOW节点列表 |
 | POST | `/api/now/peer/remove` | 移除指定的ESP-NOW节点 |
+| GET | `/api/espnow/role` | **获取当前角色** (v7.0) |
+| POST | `/api/espnow/role` | **设置角色** (v7.0) |
+| GET | `/api/espnow/role/status` | **获取角色状态** (v7.0) |
+| POST | `/api/espnow/role/start` | **启动角色动作** (v7.0) |
+| POST | `/api/espnow/role/stop` | **停止角色动作** (v7.0) |
+| GET | `/api/system/hwinfo` | **获取硬件信息** (v7.0) |
+| GET | `/api/ble/status` | **BLE状态查询** (v7.0) |
+| POST | `/api/ble/advertise` | **开始BLE广播** (v7.0) |
+| POST | `/api/ble/scan` | **开始BLE扫描** (v7.0) |
+| GET | `/api/ble/devices` | **获取发现设备列表** (v7.0) |
+| POST | `/api/ble/pair` | **手动配对设备** (v7.0) |
+| GET | `/api/ble/name` | **获取BLE设备名** (v7.0) |
+| POST | `/api/ble/name` | **设置BLE设备名** (v7.0) |
+
+### 新增功能 (v7.0)
+
+- **动态PMK机制** — PMK 首次启动自动生成并同步给对端，无需手动配置
+- **一键解绑** — `POST /api/espnow/unbind-all` 批量解绑所有节点
+- **消息模板 CRUD** — 新增 add/remove 端点，完整的模板管理
+- **模板批量发送** — `/api/espnow/send/template` 和 `/api/espnow/send/templates`
+- **接收消息历史** — `/api/espnow/messages` 查询接收到的消息
+- **角色控制模块** — 完整的角色设置/查询/启动/停止 API
+- **BLE 控制 API** — 通过 HTTP 控制 BLE 广播/扫描/配对
+- **系统信息 API** — `/api/system/hwinfo` 查询硬件和固件信息
 
 ### 新增功能 (v6.0)
 
@@ -191,8 +230,7 @@ ESP-NOW是一种高效的点对点WiFi通信协议，但传统的ESP-NOW配对�
 │  ────────────────►  连接AP (SSID)                                 │
 │                    返回IP: 192.168.4.x                            │
 │                                                                      │
-│  2. 初始化ESP-NOW + 设置PMK                                │
-│     esp_now_set_pmk("pmk1234567890123")                     │
+│  2. 初始化ESP-NOW (PMK 由配对消息自动同步)              │
 │                                                              │
 │  3. 注册自己                                                 │
 │  ────────────────►  POST /api/espnow/register                │
@@ -397,9 +435,9 @@ Content-Type: application/json
 - 节点需要将这两个值用于添加主机为peer
 - 节点应该使用响应中的channel，而不是请求中的channel
 - ⚠️ 注册成功后，节点必须在 ESP-NOW 初始化后执行以下操作：
-  1. `esp_now_set_pmk((const uint8_t*)"pmk1234567890123")` — 设置 PMK
-  2. `esp_now_add_peer(&peer)` — 添加主机为 peer（`peer.encrypt = false`）
-  3. 使用响应中的 `ap_channel` 作为 `peer.channel`
+  1. `esp_now_add_peer(&peer)` — 添加主机为 peer（`peer.encrypt = false`）
+  2. 使用响应中的 `ap_channel` 作为 `peer.channel`
+  3. ⚠️ PMK 无需手动设置，配对消息会自动同步 PMK
 
 ---
 
@@ -674,7 +712,7 @@ curl -X POST http://192.168.4.1/api/espnow/broadcast \
 │          │    │ broadcast    │    │ (hex decode → bin) │
 └──────────┘    └──────────────┘    └────────────────────┘
                                          │
-                                    esp_now_set_pmk("pmk1234567890123")
+                                    PMK 由配对消息自动同步
                                     peer.encrypt = false
                                     peer.channel = ap_channel
 ```
@@ -760,17 +798,16 @@ static void on_data_recv(const esp_now_recv_info_t* info,
 }
 
 void espnow_init_receiver(void) {
-    // ⚠️ 步骤1: 设置 PMK — 必须与主机一致
-    esp_now_set_pmk((const uint8_t*)"pmk1234567890123");
+    // ⚠️ PMK 无需手动设置，配对消息会自动同步 PMK
 
-    // 步骤2: 初始化 ESP-NOW
+    // 步骤1: 初始化 ESP-NOW
     esp_now_init();
 
-    // 步骤3: 注册回调
+    // 步骤2: 注册回调
     esp_now_register_recv_cb(on_data_recv);
     esp_now_register_send_cb(on_data_sent);
 
-    // 步骤4: 添加主机为 peer（加密必须为 false）
+    // 步骤3: 添加主机为 peer（加密必须为 false）
     // ap_mac 从 /api/espnow/register 响应中获取
     // ap_channel 从响应的 ap_channel 字段获取
     uint8_t ap_mac[6] = {0x3C, 0x0F, 0x02, 0xD1, 0xE6, 0x94}; // 示例
@@ -798,7 +835,7 @@ void espnow_init_receiver(void) {
 
 | # | 检查项 | 正确配置 | 如何验证 |
 |---|--------|---------|---------|
-| 1 | **PMK 一致** | 双方都设置为 `"pmk1234567890123"` | 检查双方代码是否调用 `esp_now_set_pmk()` |
+| 1 | **PMK 一致** | PMK 由配对消息自动同步，无需手动设置 | 检查对端是否收到配对消息并自动同步 PMK |
 | 2 | **信道一致** | 双方在同一信道 | 查看 register 响应中的 `ap_channel`，对端必须使用该信道 |
 | 3 | **双向 peer** | 主机添加了节点，节点也添加了主机 | 调用 `esp_now_is_peer_exist()` 检查 |
 | 4 | **encrypt = false** | 双方 peer 的 encrypt 都为 false | 检查 `esp_now_add_peer()` 调用 |
@@ -841,10 +878,13 @@ ACK 消息复用 `esp_now_pair_msg_t` 结构体，与配对/解绑消息相同�
 ```c
 #pragma pack(push, 1)
 typedef struct {
-    uint32_t magic;        // 0x4553504E ("ESPN")
-    uint8_t  type;         // 0x05 = ESP_NOW_MSG_ACK
-    uint8_t  mac[6];       // 发送者的 ESP-NOW MAC
-    char     name[32];     // 设备名称
+    uint32_t magic;          // 0x4553504E ("ESPN")
+    uint8_t  type;           // 消息类型 (0x01-0x06, 0x10)
+    uint8_t  mac[6];         // 发送者的 ESP-NOW MAC
+    uint8_t  channel;        // 发送者当前 WiFi 信道
+    uint8_t  peer_type;      // 发送者节点类型 (PEER_TYPE_WIFI=0, PEER_TYPE_ESPNOW=1)
+    char     name[32];       // 设备名称
+    uint8_t  pmk[16];        // 自动生成的 PMK，用于对端同步
 } esp_now_pair_msg_t;
 #pragma pack(pop)
 ```
@@ -857,7 +897,9 @@ typedef struct {
 | `0x02` | `ESP_NOW_MSG_PAIR_RESPONSE` | 配对响应 |
 | `0x03` | `ESP_NOW_MSG_UNPAIR_REQUEST` | 解绑请求 |
 | `0x04` | `ESP_NOW_MSG_UNPAIR_RESPONSE` | 解绑响应 |
-| `0x05` | `ESP_NOW_MSG_ACK` | **ACK确认** |
+| `0x05` | `ESP_NOW_MSG_ACK` | ACK确认 |
+| `0x06` | `ESP_NOW_MSG_UNBIND_ALL` | **一键解绑（新增 v7.0）** |
+| `0x10` | `ESP_NOW_MSG_DATA` | 常规数据消息 |
 
 ### 6.3 ACK触发条件
 
@@ -944,6 +986,20 @@ void processPendingAck() {
 - ACK 不会触发 ACK 的 ACK（不会无限循环）
 - ACK 发送走同一 ESP-NOW 通道，不会额外占用 WiFi 带宽
 - 发送方收到 ACK 通常在 1-5ms 内（取决于底层 WiFi 调度）
+
+### 6.8 UNBIND_ALL 一键解绑协议 (v7.0)
+
+一键解绑用于批量解除所有节点的配对关系。
+
+**流程：**
+发起方通过 HTTP API 调用 `/api/espnow/unbind-all`：
+1. 向所有已配对的 peer 发送 UNBIND_ALL 消息（type=0x06）
+2. 清空本地 peer 列表
+3. 保存到 NVS
+
+**对端收到 UNBIND_ALL 后：**
+1. 自动清空本地 peer 列表
+2. 不再保留发起方的 peer 记录
 
 ---
 
@@ -1043,9 +1099,110 @@ Web 界面在发送区域显示当前模式标签：
 
 ---
 
-## 8. 实现示例
+## 8. 角色控制模块 (v7.0)
 
-### 8.1 ESP32 节点实现 (v2.0)
+### 8.1 概述
+
+本系统支持三种**角色模式**（Role），角色设置通过 NVS 持久化，与 BLE 工作状态分离：
+
+- **角色（Role）**：设备身份，OFF / BROADCAST (Slave) / RECEIVE (Master)，持久化存储
+- **状态（State）**：BLE 工作状态，ACTIVE（工作中）/ IDLE（已停止），由 60s 计时器或按钮控制
+
+#### 行为规则
+
+| 场景 | MASTER (RECEIVE) | SLAVE (BROADCAST) |
+|------|------------------|-------------------|
+| **开机** | 自动开始 60s BLE 扫描 | 自动开始 60s BLE 广播 |
+| **60s 到期** | 停止扫描，state=IDLE，remaining=0 | 停止广播，state=IDLE，remaining=0 |
+| **按 START** | 重启 60s BLE 扫描 | 重启 60s BLE 广播 |
+| **按 STOP** | 立即停止 BLE，state=IDLE | 立即停止 BLE，state=IDLE |
+| **GPIO4 拉低** | 启动/重置 60s BLE 扫描 | 启动/重置 60s BLE 广播 |
+
+> **角色设定与按钮无关**：角色（MASTER/SLAVE）一旦设定就持续有效，按键只控制 BLE 工作状态。ESP-NOW 通信在 BLE 停止后仍可正常工作。
+
+### 8.2 角色类型
+
+| 角色 | 值 | 常量 | 说明 |
+|------|-----|------|------|
+| OFF | 0 | ROLE_OFF | 关闭，无操作 |
+| BROADCAST (Slave) | 1 | ROLE_BROADCAST | 发送 BLE 广播，等待配对 |
+| RECEIVE (Master) | 2 | ROLE_RECEIVE | 接收 BLE 广播，主动配对 |
+
+### 8.3 C API
+
+```c
+// 初始化角色控制（开机自启 BLE 动作）
+void role_control_init(void);
+
+// 角色配置 (NVS持久化)
+void role_control_set_role(role_type_t role);
+role_type_t role_control_get_role(void);
+
+// 启动/停止角色动作（START/STOP 按钮）
+bool role_control_start(void);
+void role_control_stop(void);
+
+// 状态查询
+role_state_t role_control_get_state(void);     // ACTIVE 或 IDLE
+int role_control_get_remaining(void);           // 角色剩余活跃时间(秒)，IDLE时返回0
+int role_control_get_peer_count(void);          // 活跃peer数
+```
+
+### 8.4 常量
+- `ROLE_ACTIVE_SECONDS` = 60 — BLE 工作超时时间
+- `ROLE_GPIO_TRIGGER` = GPIO_NUM_4 — GPIO 触发引脚（拉低启动/重置 BLE）
+
+### 8.5 Web API 端点
+
+| 方法 | 路径 | 描述 |
+|------|------|------|
+| GET | `/api/espnow/role` | 获取当前角色 |
+| POST | `/api/espnow/role` | 设置角色 |
+| GET | `/api/espnow/role/status` | 获取角色状态(state/remaining/peers) |
+| POST | `/api/espnow/role/start` | 启动 BLE 动作（60s 倒计时） |
+| POST | `/api/espnow/role/stop` | 停止 BLE 动作（立即，状态归 IDLE） |
+
+#### 8.5.1 GET /api/espnow/role/status
+
+获取 BLE 工作状态和剩余时间。
+
+**响应示例：**
+```json
+{
+    "role": 2,
+    "state": "SCANNING",
+    "remaining": 45,
+    "peers": 1,
+    "role_state": 1
+}
+```
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `role` | int | 角色类型：0=OFF, 1=BROADCAST, 2=RECEIVE |
+| `state` | string | BLE 状态："SCANNING" / "ADVERTISING" / "IDLE" |
+| `remaining` | int | BLE 剩余时间(秒)，IDLE 时返回 0 |
+| `peers` | int | 已配对 peer 数量 |
+| `role_state` | int | 角色工作状态：0=IDLE, 1=ACTIVE |
+
+#### 8.5.2 POST /api/espnow/role/start
+
+启动/重启 BLE 动作，开始 60 秒倒计时。如果 BLE 已在运行则重置倒计时。
+
+- 角色为 OFF 时返回 `{"success":false,"error":"role_off"}`
+- 正常返回 `{"success":true}`
+
+#### 8.5.3 POST /api/espnow/role/stop
+
+立即停止 BLE 动作（扫描/广播），state 置为 IDLE，remaining 归 0，关闭 LED。
+
+- 始终返回 `{"success":true}`
+
+---
+
+## 9. 实现示例
+
+### 9.1 ESP32 节点实现 (v2.0)
 
 ```cpp
 #include <WiFi.h>
@@ -1077,8 +1234,7 @@ void setup() {
     if (esp_now_init() == ESP_OK) {
         Serial.println("ESP-NOW initialized");
 
-        // ⚠️ 设置 PMK — 必须与主机一致
-        esp_now_set_pmk((const uint8_t*)"pmk1234567890123");
+        // ⚠️ PMK 无需手动设置，配对消息会自动同步 PMK
 
         // 注册回调
         esp_now_register_recv_cb(onDataReceived);
@@ -1194,7 +1350,7 @@ void loop() {
 }
 ```
 
-### 8.2 ESP8266 节点实现
+### 9.2 ESP8266 节点实现
 
 ```cpp
 #include <ESP8266WiFi.h>
@@ -1218,8 +1374,7 @@ void setup() {
     }
     
     if (esp_now_init() == ESP_OK) {
-        // ⚠️ 设置 PMK — 必须与主机一致
-        esp_now_set_pmk((const uint8_t*)"pmk1234567890123");
+        // ⚠️ PMK 无需手动设置，配对消息会自动同步 PMK
 
         esp_now_register_recv_cb(onDataReceived);
         esp_now_register_send_cb(onDataSent);
@@ -1365,7 +1520,7 @@ if __name__ == "__main__":
     main()
 ```
 
-### 8.4 JavaScript/Node.js 实现
+### 9.4 JavaScript/Node.js 实现
 
 ```javascript
 const http = require('http');
@@ -1422,9 +1577,9 @@ main().catch(console.error);
 
 ---
 
-## 9. 错误处理
+## 10. 错误处理
 
-### 9.1 常见错误及解决方案
+### 10.1 常见错误及解决方案
 
 | # | 错误现象 | 原因 | 解决方案 |
 |---|---------|------|----------|
@@ -1432,7 +1587,7 @@ main().catch(console.error);
 | 2 | GET /master 返回404 | API路径错误 | 确认API路径 |
 | 3 | POST /register 返回500 | JSON格式错误 | 检查JSON格式 |
 | 4 | ESP-NOW添加peer失败 | MAC地址无效 | 确认MAC格式正确 |
-| 5 | 发送成功(success:true)但**对端收不到** | **PMK不一致** | 对端必须设置 `esp_now_set_pmk("pmk1234567890123")` |
+| 5 | 发送成功(success:true)但**对端收不到** | **PMK不一致** | PMK 由配对消息自动同步，检查对端是否正确接收配对消息 |
 | 6 | 发送成功但对端收不到 | **信道不匹配** | 使用 register 响应的 `ap_channel`，对端必须同信道 |
 | 7 | 发送成功但对端收不到 | **对端未添加主机为 peer** | 对端必须用 register 响应的 `ap_mac` 调用 `esp_now_add_peer()` |
 | 8 | 发送成功但对端收不到 | **对端 encrypt 设置错误** | 对端 `peer.encrypt` 必须为 `false` |
@@ -1444,7 +1599,7 @@ main().catch(console.error);
 | 14 | 发送成功但ACK状态false | 对端未识别ACK消息 | 对端 `recv_cb` 需正确解析 `esp_now_pair_msg_t` 的 `magic` 和 `type` |
 | 15 | 单播发送成功但收不到ACK | 消息被当作广播发送 | 对端仅对非广播（目标MAC不是 `FF:FF:FF:FF:FF:FF`）回复ACK |
 
-### 9.2 调试流程
+### 10.2 调试流程
 
 ```
 发送失败排查:
@@ -1454,7 +1609,7 @@ main().catch(console.error);
   │   └─ 检查 ESP-NOW 是否已初始化
   │
   └─ success:true 但对方收不到?
-      ├─ 1. 对端设置了 esp_now_set_pmk("pmk1234567890123") ?
+      ├─ 1. PMK 是否已通过配对消息自动同步 ?
       ├─ 2. 对端 WiFi 信道 == register 响应的 ap_channel ?
       ├─ 3. 对端调用了 esp_now_add_peer(ap_mac) ?
       ├─ 4. 对端 peer.encrypt == false ?
@@ -1462,7 +1617,7 @@ main().catch(console.error);
       └─ 6. 数据长度 ≤ 250 字节 ?
 ```
 
-### 9.3 重试机制
+### 10.3 重试机制
 
 ```cpp
 bool registerWithRetry(int maxRetries = 3) {
@@ -1492,16 +1647,16 @@ bool registerWithRetry(int maxRetries = 3) {
 
 ---
 
-## 10. 其他平台开发指南
+## 11. 其他平台开发指南
 
-### 10.1 通用要求
+### 11.1 通用要求
 
 1. **WiFi STA模式** - 设备需要支持WiFi客户端模式
 2. **HTTP Client** - 支持HTTP GET/POST请求
 3. **JSON解析** - 能够解析和构建JSON数据
 4. **ESP-NOW支持** - 设备需要支持ESP-NOW协议（仅ESP系列）
 
-### 10.2 平台兼容性
+### 11.2 平台兼容性
 
 | 平台 | WiFi | HTTP | JSON | ESP-NOW |
 |------|------|------|------|----------|
@@ -1512,7 +1667,7 @@ bool registerWithRetry(int maxRetries = 3) {
 | 手机APP | ✅ | ✅ | ✅ | ❌ |
 | 其他MCU | ✅ | ✅ | ✅ | ❌ |
 
-### 10.3 非ESP设备注意事项
+### 11.3 非ESP设备注意事项
 
 对于非ESP系列设备（如树莓派、PC等），由于不支持ESP-NOW协议，可以通过以下方式使用此API：
 
@@ -1520,32 +1675,32 @@ bool registerWithRetry(int maxRetries = 3) {
 2. **间接通信** - 通过HTTP API中转ESP-NOW数据
 3. **监控和管理** - 查看设备状态、管理节点
 
-### 10.4 重要提示
+### 11.4 重要提示
 
-- **设置 PMK** — 对端 ESP-NOW 初始化后必须调用 `esp_now_set_pmk((const uint8_t*)"pmk1234567890123")`
+- **设置 PMK** — PMK 由配对消息自动同步，对端无需手动设置
 - **使用响应中的 channel** — POST /register 响应中的 `ap_channel` 字段是主机实际使用的 channel
 - **不要假设 channel** — 不要硬编码 channel 值，应使用 API 返回的实际值
 - **encrypt = false** — 添加 peer 时必须设置 `peer.encrypt = false`
 - **hex 编码数据** — send/broadcast API 的 `data` 字段必须为 hex 编码字符串
-- **处理失败情况** — 检查响应中的 `success` 字段，逐一排查 8 项清单
+- **处理失败情况** — 检查响应中的 `success` 字段，逐一排查清单项
 
 ---
 
-## 11. 最佳实践
+## 12. 最佳实践
 
-### 11.1 安全性
+### 12.1 安全性
 
 - ⚠️ **AP密码保护** - 生产环境中应设置AP密码
 - ⚠️ **API认证** - 可添加token验证防止未授权注册
 - ⚠️ **数据加密** - 敏感数据应加密传输
 
-### 11.2 性能优化
+### 12.2 性能优化
 
 - 📊 **批量注册** - 支持批量注册多个节点
 - 🔄 **自动重连** - 实现WiFi和ESP-NOW的自动重连
 - 📝 **日志记录** - 记录组网过程便于调试
 
-### 11.3 可靠性
+### 12.3 可靠性
 
 - ✅ **超时处理** - 所有网络操作设置超时
 - ✅ **错误恢复** - 失败后自动重试
@@ -1553,9 +1708,9 @@ bool registerWithRetry(int maxRetries = 3) {
 
 ---
 
-## 12. API测试
+## 13. API测试
 
-### 12.1 使用curl测试
+### 13.1 使用curl测试
 
 ```bash
 # 获取主机信息
@@ -1585,7 +1740,7 @@ curl -X POST http://192.168.4.1/api/espnow/unpair \
   -d '{"mac":"AA:BB:CC:DD:EE:FF"}'
 ```
 
-### 12.2 浏览器测试
+### 13.2 浏览器测试
 
 直接在浏览器中访问：
 - `http://192.168.4.1/api/espnow/master`
@@ -1603,9 +1758,10 @@ curl -X POST http://192.168.4.1/api/espnow/unpair \
 | 4.0 | 2026-05-18 | System | 添加ESP-NOW消息发送和广播功能 |
 | 5.0 | 2026-05-18 | System | 关键约定、消息协议、排查清单、数据格式对照表 |
 | **6.0** | **2026-05-20** | **System** | **应用层ACK确认协议、消息模板Web管理、Text/HEX自动转换、ACK状态追踪** |
+| **7.0** | **2026-05-25** | **System** | **动态PMK机制、一键解绑UNBIND_ALL、角色控制模块、消息模板CRUD/批量发送、消息历史API、BLE控制API、系统信息API** |
 
 ---
 
-**文档版本**: 6.0  
-**更新日期**: 2026-05-20  
+**文档版本**: 7.0  
+**更新日期**: 2026-05-25  
 **适用平台**: ESP-IDF v6.0.1 / ESP32-S3

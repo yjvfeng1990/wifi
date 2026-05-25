@@ -123,11 +123,24 @@ bool role_control_start(void)
 
     xSemaphoreTake(s_role_mutex, portMAX_DELAY);
     if (s_state == ROLE_STATE_ACTIVE) {
-        // 已经活跃，重置计时器
+        // 已经活跃：重置计时器
         if (s_activity_timer) {
             xTimerReset(s_activity_timer, 0);
         }
         s_active_start_time = xTaskGetTickCount();
+
+        // 检查 BLE 操作是否已停止（如活动定时器到期后），需要重新启动
+        // 注意：ble_pairing 内部有自己的互斥锁，不依赖 s_role_mutex，因此可以安全地在持有锁时调用
+        if (s_role == ROLE_RECEIVE && !ble_pairing_is_scanning()) {
+            ble_pairing_set_auto_pair(true);
+            ble_pairing_start_scan(60);
+            ESP_LOGI(TAG, "Receive (Master): BLE scan restarted");
+        } else if (s_role == ROLE_BROADCAST && !ble_pairing_is_advertising()) {
+            ble_pairing_set_auto_pair(true);
+            ble_pairing_start_advertise(NULL);
+            ESP_LOGI(TAG, "Broadcast (Slave): BLE advertise restarted");
+        }
+
         xSemaphoreGive(s_role_mutex);
         ESP_LOGI(TAG, "Role timer reset, %ds remaining", ROLE_ACTIVE_SECONDS);
         return true;
@@ -167,11 +180,12 @@ bool role_control_start(void)
     return true;
 }
 
-// BLE扫描计时回调：仅用于"remaining"倒计时显示，不停止角色
-// 角色一旦启动就持续有效，用户可通过WEB UI手动停止
+// BLE操作计时回调：60s到期后停止BLE，设置state=IDLE
+// MASTER/SLAVE 统一行为：60s后BLE停止，剩余时间归0
+// 后续可通过 START 按钮重新启动 BLE
 static void activity_timer_callback(TimerHandle_t timer)
 {
-    // Stop BLE operations when timer expires, but keep role state ACTIVE
+    // Stop BLE operations when timer expires
     if (ble_pairing_is_burst_mode()) {
         ble_pairing_stop_adv_burst();
     }
@@ -181,7 +195,13 @@ static void activity_timer_callback(TimerHandle_t timer)
     if (ble_pairing_is_advertising()) {
         ble_pairing_stop_advertise();
     }
-    ESP_LOGI(TAG, "BLE scan phase complete, role remains active");
+
+    // 设置state=IDLE：remaining归0，UI正确显示BLE状态
+    xSemaphoreTake(s_role_mutex, portMAX_DELAY);
+    s_state = ROLE_STATE_IDLE;
+    xSemaphoreGive(s_role_mutex);
+
+    ESP_LOGI(TAG, "BLE phase complete (60s), state=IDLE");
 }
 
 // GPIO4中断处理
@@ -231,13 +251,6 @@ static void role_task(void* arg)
                 ESP_LOGI(TAG, "Broadcast: staying in advertise mode");
             }
         }
-
-        // SLAVE (BROADCAST) 自动恢复: 如果角色是广播但状态为IDLE, 自动重启广播
-        // 活动定时器到期后 SLAVE 会停止广播, 此看门狗确保 SLAVE 持续可被发现
-        if (s_state != ROLE_STATE_ACTIVE && s_role == ROLE_BROADCAST) {
-            ESP_LOGI(TAG, "SLAVE idle detected, auto-restarting broadcast");
-            role_control_start();
-        }
     }
 }
 
@@ -273,6 +286,13 @@ void role_control_init(void)
     xTaskCreate(role_task, "role_task", 3072, NULL, 5, NULL);
 
     ESP_LOGI(TAG, "Role control initialized, current role=%d, state=IDLE", s_role);
+
+    // 开机自动启动 BLE（MASTER 扫描 / SLAVE 广播），60s 后自动停止
+    // BLE 已在 ble_pairing_init() 中初始化，可安全调用
+    if (s_role == ROLE_RECEIVE || s_role == ROLE_BROADCAST) {
+        ESP_LOGI(TAG, "Boot auto-start: role=%d", s_role);
+        role_control_start();
+    }
 }
 
 void role_control_set_role(role_type_t role)
