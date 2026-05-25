@@ -9,7 +9,7 @@ extern "C" {
 #endif
 
 #define ROLE_GPIO_TRIGGER    GPIO_NUM_4
-#define ROLE_ACTIVE_SECONDS  60
+#define ROLE_ACTIVE_SECONDS  60      // 与 BLE 扫描时长一致，扫描配对完成后角色自动结束
 
 typedef enum {
     ROLE_OFF = 0,
@@ -31,6 +31,9 @@ role_type_t role_control_get_role(void);
 // 启动/停止角色动作
 bool role_control_start(void);
 void role_control_stop(void);
+
+// 重置显示计时器（不改变角色状态，仅影响remaining倒计时）
+void role_control_reset_timer(void);
 
 // 状态查询
 role_state_t role_control_get_state(void);

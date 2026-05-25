@@ -12,6 +12,8 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "freertos/timers.h"
+#include "freertos/task.h"
+#include "freertos/queue.h"
 #include "ble_pairing.h"
 #include "wifi_now.h"
 #include "role_control.h"
@@ -21,6 +23,12 @@ static const char* TAG = "BLE_PAIR";
 #define BLE_MFG_ID              0x02E5
 #define BLE_TAG_MARKER_0        'E'
 #define BLE_TAG_MARKER_1        'N'
+
+// BLE 扫描重试：当发现设备少于 2 个时自动补扫
+// 用于规避 ESP32-S3 BLE controller 内部状态机交替丢失设备的 bug
+// 策略：每次补扫前先复位 BLE controller（清空状态机），再用更长的时间扫描
+#define MAX_SCAN_RETRIES        3       // 最多重试 3 次
+#define RETRY_SCAN_DURATION     30      // 每次补扫 30 秒（足够 controller 恢复）
 
 static SemaphoreHandle_t s_mutex              = NULL;
 static SemaphoreHandle_t s_scan_mutex         = NULL;
@@ -38,6 +46,12 @@ static TimerHandle_t s_scan_timer = NULL;
 static TimerHandle_t s_burst_timer = NULL;
 static bool          s_burst_mode = false;
 static TickType_t    s_last_burst_ticks = 0;  // 上次burst启动时间, 用于频率限制
+static TickType_t    s_scan_start_ticks = 0;  // 本次扫描开始时间, burst延迟判断
+static SemaphoreHandle_t s_scan_stop_sem = NULL; // 同步信号量: 等待BLE控制器确认扫描停止
+static int           s_scan_retries = 0;       // 当前补扫计数
+static TimerHandle_t s_post_scan_timer = NULL;  // 扫描停止后的延迟处理定时器
+static TickType_t    s_disc_time[BLE_MAX_DISCOVERED] = {0}; // 每个设备被发现的时间戳（诊断用）
+static int           s_adv_report_total = 0;        // 诊断：本次扫描收到的 ADV_REPORT 总数
 
 static uint8_t build_adv_raw(uint8_t* buf, uint8_t buf_size)
 {
@@ -139,14 +153,6 @@ static bool parse_scan_mfg_data(const uint8_t* adv_data, uint8_t adv_data_len,
     return false;
 }
 
-static bool is_duplicate_mac(const uint8_t* mac)
-{
-    for (int i = 0; i < s_discovered_count; i++) {
-        if (memcmp(s_discovered[i].mac, mac, 6) == 0) return true;
-    }
-    return false;
-}
-
 static bool is_duplicate_now_mac(const uint8_t* now_mac)
 {
     for (int i = 0; i < s_discovered_count; i++) {
@@ -177,20 +183,12 @@ static void parse_adv_name(const uint8_t* adv_data, uint8_t adv_data_len,
     }
 }
 
-static void try_switch_to_peer_channel(uint8_t peer_channel)
-{
-    // 只SLAVE模式切换信道，MASTER模式跟随WiFi STA不切换
-    if (role_control_get_role() != ROLE_BROADCAST) {
-        return;
-    }
-    uint8_t my_channel = wifi_now_get_channel();
-    if (my_channel != peer_channel && peer_channel != 0) {
-        ESP_LOGI(TAG, "SLAVE switching from ch %d to ch %d",
-                 my_channel, peer_channel);
-        wifi_now_set_channel(peer_channel);
-        wifi_now_update_peers_channel(peer_channel);
-    }
-}
+// 扫描结束后批量处理所有发现的设备（add_peer + save_peers + send_pair_request），
+// 不再在 GAP 回调中做任何 ESP-NOW 操作，彻底避免 ESP-NOW 传输干扰 BLE 扫描。
+
+// 前向声明（定义在后，因相互引用需要提前声明）
+static void deferred_process_task_func(void *arg);
+static void post_scan_timer_callback(TimerHandle_t timer);
 
 static void gap_event_handler(esp_gap_ble_cb_event_t event,
                                esp_ble_gap_cb_param_t* params)
@@ -228,17 +226,42 @@ static void gap_event_handler(esp_gap_ble_cb_event_t event,
     case ESP_GAP_BLE_EXT_SCAN_START_COMPLETE_EVT:
         if (params->ext_scan_start.status == ESP_BT_STATUS_SUCCESS) {
             s_scanning = true;
+            s_scan_start_ticks = xTaskGetTickCount();
             ESP_LOGI(TAG, "Scan started");
         }
         break;
     case ESP_GAP_BLE_SCAN_STOP_COMPLETE_EVT:
-        if (params->scan_stop_cmpl.status == ESP_BT_STATUS_SUCCESS) {
-            s_scanning = false;
-            ESP_LOGI(TAG, "Scan stopped, discovered=%d", s_discovered_count);
+        s_scanning = false;
+        // 无论状态码是否成功，都通知等待扫描停止的同步信号量
+        if (s_scan_stop_sem) {
+            xSemaphoreGive(s_scan_stop_sem);
+        }
+        ESP_LOGI(TAG, "Scan stopped (status=%d), discovered=%d, total_adv=%d",
+                 params->scan_stop_cmpl.status, s_discovered_count, s_adv_report_total);
+
+        // 启动延迟处理定时器（100ms），避免与 stop_scan 的同步信号量竞争
+        // 无论扫描如何停止（自动停止或手动停止），都在此统一处理后处理逻辑
+        if (s_post_scan_timer) {
+            xTimerReset(s_post_scan_timer, 0);
+        } else {
+            s_post_scan_timer = xTimerCreate("post_scan",
+                                              pdMS_TO_TICKS(100),
+                                              pdFALSE, NULL, post_scan_timer_callback);
+            if (s_post_scan_timer) {
+                xTimerStart(s_post_scan_timer, 0);
+            }
         }
         break;
     case ESP_GAP_BLE_EXT_ADV_REPORT_EVT: {
+        s_adv_report_total++;
         const esp_ble_gap_ext_adv_report_t* report = &params->ext_adv_report.params;
+        // 诊断用：每 50 个包打印一次统计，避免在密集 BLE 环境中串口泛洪
+        if (s_adv_report_total % 50 == 1) {
+            ESP_LOGI(TAG, "ADV_REPORT #%d: latest addr=" MACSTR ", rssi=%d, data_len=%d",
+                     s_adv_report_total,
+                     MAC2STR(report->addr), report->rssi,
+                     report->adv_data_len);
+        }
         uint8_t now_mac[6];
         char name[BLE_DEV_NAME_MAX] = {0};
         uint8_t peer_channel = 0;
@@ -252,9 +275,9 @@ static void gap_event_handler(esp_gap_ble_cb_event_t event,
                                name, sizeof(name));
             }
             bool already_discovered = is_duplicate_now_mac(now_mac);
-            bool already_paired = wifi_now_is_peer_exists(now_mac);
-            
-            // 将对方信息加入发现列表
+
+            // 只记录发现的设备到列表，不进行任何 ESP-NOW 操作
+            // ESP-NOW 的 add_peer/save/send 全部推迟到扫描结束后统一处理
             xSemaphoreTake(s_scan_mutex, portMAX_DELAY);
             if (!already_discovered && s_discovered_count < BLE_MAX_DISCOVERED) {
                 ble_discovered_device_t* dev = &s_discovered[s_discovered_count];
@@ -264,79 +287,100 @@ static void gap_event_handler(esp_gap_ble_cb_event_t event,
                 dev->rssi = report->rssi;
                 dev->channel = peer_channel;
                 dev->peer_type = peer_type;
+                s_disc_time[s_discovered_count] = xTaskGetTickCount();
                 s_discovered_count++;
 
-                ESP_LOGI(TAG, "Discovered: name=%s, NOW_MAC=" MACSTR
-                         ", ch=%d, type=%d, rssi=%d",
-                         name, MAC2STR(now_mac), peer_channel, peer_type, report->rssi);
+                ESP_LOGI(TAG, "Discovered[%d]: name=%s, NOW_MAC=" MACSTR
+                         ", ch=%d, type=%d, rssi=%d, total=%d",
+                         s_discovered_count - 1, name, MAC2STR(now_mac), peer_channel, peer_type,
+                         report->rssi, s_discovered_count);
+            } else if (already_discovered) {
+                ESP_LOGD(TAG, "Dup disc(now): name=%s, rssi=%d, cnt=%d",
+                         name, report->rssi, s_discovered_count);
             }
             xSemaphoreGive(s_scan_mutex);
-
-            // 尝试ESP-NOW配对（信道匹配时才有效）
-            if (s_auto_pair && !already_paired) {
-                uint8_t my_channel = wifi_now_get_channel();
-                if (my_channel == peer_channel || peer_channel == 0) {
-                    // 信道匹配或未知信道，直接ESP-NOW配对
-                    bool added = wifi_now_add_peer_with_name(now_mac, my_channel, name, peer_type);
-                    if (added) {
-                        ESP_LOGI(TAG, "Auto-paired with %s (" MACSTR "), ch=%d",
-                                 name, MAC2STR(now_mac), my_channel);
-                        wifi_now_save_peers();
-                        wifi_now_send_pair_request(now_mac);
-                    }
-                } else {
-                    // 信道不匹配: 用peer的信道添加对端, 同时发BLE回复让对方也能发现我们
-                    bool added = wifi_now_add_peer_with_name(now_mac, peer_channel, name, peer_type);
-                    if (added) {
-                        ESP_LOGI(TAG, "Cross-channel paired with %s (" MACSTR
-                                 "), us=%d, peer=%d",
-                                 name, MAC2STR(now_mac), my_channel, peer_channel);
-                        wifi_now_save_peers();
-                    }
-                    ESP_LOGI(TAG, "Channel mismatch (us=%d, peer=%d)",
-                             my_channel, peer_channel);
-                    // 先切换信道, 确保ESP-NOW在正确信道上发送
-                    try_switch_to_peer_channel(peer_channel);
-                    // 切换后再发送Pair Request
-                    if (added) {
-                        wifi_now_send_pair_request(now_mac);
-                    }
-                    // BLE burst让对方在扫描阶段发现我们
-                    if (!s_burst_mode && !s_advertising) {
-                        TickType_t now = xTaskGetTickCount();
-                        if (s_last_burst_ticks == 0 || now - s_last_burst_ticks > pdMS_TO_TICKS(15000)) {
-                            s_last_burst_ticks = now;
-                            ble_pairing_start_adv_burst(NULL, 5);
-                        }
-                    }
-                }
-            } else if (s_auto_pair && already_paired && !already_discovered) {
-                // 从NVS恢复的peer, 首次BLE发现时检查信道
-                uint8_t my_channel = wifi_now_get_channel();
-                if (my_channel != peer_channel && peer_channel != 0) {
-                    ESP_LOGI(TAG, "Restored peer on diff ch (us=%d, peer=%d)",
-                             my_channel, peer_channel);
-                    // 更新本地peer信道为peer的实际信道
-                    wifi_now_add_peer_with_name(now_mac, peer_channel, name, peer_type);
-                    // 先切换信道, 确保ESP-NOW在正确信道上发送
-                    try_switch_to_peer_channel(peer_channel);
-                    // 切换后再发送Pair Response
-                    wifi_now_send_pair_response(now_mac);
-                    // BLE burst让对方在扫描阶段发现我们
-                    if (!s_burst_mode && !s_advertising) {
-                        TickType_t now = xTaskGetTickCount();
-                        if (s_last_burst_ticks == 0 || now - s_last_burst_ticks > pdMS_TO_TICKS(15000)) {
-                            s_last_burst_ticks = now;
-                            ble_pairing_start_adv_burst(NULL, 5);
-                        }
-                    }
-                }
-            }
         }
         break;
     }
     default:
         break;
+    }
+}
+
+// 前向声明
+static void ble_pairing_process_discovered(void);
+
+// 扫描停止后的延迟处理回调：每100ms检查是否需要进行补扫或处理
+// 放在定时器回调而非 GAP 事件中，以避免在 BLE controller 上下文执行复杂操作
+static void post_scan_timer_callback(TimerHandle_t timer)
+{
+    // 如果正在扫描（如补扫已启动），不做任何事
+    if (s_scanning) return;
+
+    // 打印诊断信息：每个设备被发现的时间（相对启动时间）
+    for (int i = 0; i < s_discovered_count; i++) {
+        TickType_t elapsed = s_disc_time[i] - s_scan_start_ticks;
+        ESP_LOGI(TAG, "  DIAG: dev[%d]=%s discovered at +%dms",
+                 i, s_discovered[i].name, (int)(elapsed * portTICK_PERIOD_MS));
+    }
+
+    // 扫描完全停止后的处理逻辑
+    // 如果发现设备少于 2 个且还有补扫机会，先复位 BLE controller 再启动补扫
+    if (s_discovered_count < 2 && s_scan_retries < MAX_SCAN_RETRIES) {
+        s_scan_retries++;
+        ESP_LOGI(TAG, "=== RETRY %d/%d: only %d device(s), "
+                 "resetting BLE controller + %ds supplementary scan ===",
+                 s_scan_retries, MAX_SCAN_RETRIES, s_discovered_count, RETRY_SCAN_DURATION);
+
+        // 关键：先复位 BLE controller，清空内部状态机再重新开始扫描
+        // 避免 controller 在错误状态下继续补扫（无效补扫）
+        ble_pairing_reset_controller();
+        vTaskDelay(pdMS_TO_TICKS(200));
+
+        // 复位后使用被动扫描（避免 SCAN_REQ/SCAN_RSP 碰撞丢失）
+        esp_ble_ext_scan_params_t ext_scan_params = {};
+        ext_scan_params.own_addr_type = BLE_ADDR_TYPE_PUBLIC;
+        ext_scan_params.filter_policy = BLE_SCAN_FILTER_ALLOW_ALL;
+        ext_scan_params.scan_duplicate = BLE_SCAN_DUPLICATE_ENABLE;
+        ext_scan_params.cfg_mask = ESP_BLE_GAP_EXT_SCAN_CFG_UNCODE_MASK;
+        // 重试使用被动扫描（PASSIVE），减少空中碰撞
+        ext_scan_params.uncoded_cfg.scan_type = BLE_SCAN_TYPE_PASSIVE;
+        ext_scan_params.uncoded_cfg.scan_interval = 160;
+        ext_scan_params.uncoded_cfg.scan_window = 80;
+        ext_scan_params.coded_cfg.scan_type = BLE_SCAN_TYPE_PASSIVE;
+        ext_scan_params.coded_cfg.scan_interval = 160;
+        ext_scan_params.coded_cfg.scan_window = 80;
+
+        esp_err_t ret = esp_ble_gap_set_ext_scan_params(&ext_scan_params);
+        if (ret == ESP_OK) {
+            s_scan_start_ticks = xTaskGetTickCount();
+            // esp_ble_gap_start_ext_scan 的 duration 参数单位是 10ms
+            uint32_t retry_10ms = RETRY_SCAN_DURATION * 100;
+            ret = esp_ble_gap_start_ext_scan(retry_10ms, 0);
+            if (ret == ESP_OK) {
+                ESP_LOGI(TAG, "Retry scan %d/%d started (%ds, PASSIVE mode)",
+                         s_scan_retries, MAX_SCAN_RETRIES, RETRY_SCAN_DURATION);
+                return;
+            }
+        }
+        ESP_LOGE(TAG, "Failed to start retry scan: %d", ret);
+        // 失败后继续往下走：进行常规处理
+    }
+
+    // 补扫结束或无需补扫：创建处理任务
+    // 如果还差一个设备，但重试用完了，仍然尝试配对（能配几个算几个）
+    if (s_discovered_count < 2 && s_scan_retries >= MAX_SCAN_RETRIES) {
+        ESP_LOGW(TAG, "*** WARNING: Only %d/%d devices discovered after %d retries ***",
+                 s_discovered_count, 2, MAX_SCAN_RETRIES);
+    }
+
+    // 创建延迟处理任务。3秒等待移至任务函数内部执行，避免阻塞
+    // FreeRTOS timer 任务（阻塞 timer 任务会阻止 WiFi 管理定时器触发，
+    // 导致 web 服务器在 BLE 扫描后无响应）
+    TaskHandle_t proc_task = NULL;
+    if (xTaskCreate(deferred_process_task_func, "disc_proc", 4096,
+                    NULL, tskIDLE_PRIORITY + 1, &proc_task) != pdPASS) {
+        ESP_LOGW(TAG, "Failed to create discovered-processing task");
     }
 }
 
@@ -346,14 +390,13 @@ static void scan_timer_callback(TimerHandle_t timer)
     ble_pairing_stop_scan();
 }
 
-// 突发广告结束回调: 停止广告, 恢复扫描
 static void burst_timer_callback(TimerHandle_t timer)
 {
     ESP_LOGI(TAG, "Adv burst timeout, stopping...");
     ble_pairing_stop_adv_burst();
 }
 
-bool ble_pairing_start_adv_burst(const char* device_name, uint8_t duration_sec)
+bool ble_pairing_start_adv_burst(const char* device_name, uint16_t duration_sec)
 {
     if (s_burst_mode) {
         // 已经在突发广告中, 重置定时器
@@ -382,7 +425,7 @@ bool ble_pairing_start_adv_burst(const char* device_name, uint8_t duration_sec)
     esp_ble_gap_ext_adv_params_t ext_adv_params = {};
     ext_adv_params.type = ESP_BLE_GAP_SET_EXT_ADV_PROP_LEGACY_IND;
     ext_adv_params.interval_min = 160;
-    ext_adv_params.interval_max = 160;
+    ext_adv_params.interval_max = 200;
     ext_adv_params.channel_map = ADV_CHNL_ALL;
     ext_adv_params.own_addr_type = BLE_ADDR_TYPE_PUBLIC;
     ext_adv_params.primary_phy = ESP_BLE_GAP_PHY_1M;
@@ -439,14 +482,14 @@ void ble_pairing_stop_adv_burst(void)
         esp_ble_ext_scan_params_t ext_scan_params = {};
         ext_scan_params.own_addr_type = BLE_ADDR_TYPE_PUBLIC;
         ext_scan_params.filter_policy = BLE_SCAN_FILTER_ALLOW_ALL;
-        ext_scan_params.scan_duplicate = BLE_SCAN_DUPLICATE_DISABLE;
+        ext_scan_params.scan_duplicate = BLE_SCAN_DUPLICATE_ENABLE;
         ext_scan_params.cfg_mask = ESP_BLE_GAP_EXT_SCAN_CFG_UNCODE_MASK;
-        ext_scan_params.uncoded_cfg.scan_type = BLE_SCAN_TYPE_ACTIVE;
+        ext_scan_params.uncoded_cfg.scan_type = BLE_SCAN_TYPE_PASSIVE;
         ext_scan_params.uncoded_cfg.scan_interval = 80;
-        ext_scan_params.uncoded_cfg.scan_window = 48;
-        ext_scan_params.coded_cfg.scan_type = BLE_SCAN_TYPE_ACTIVE;
+        ext_scan_params.uncoded_cfg.scan_window = 80;
+        ext_scan_params.coded_cfg.scan_type = BLE_SCAN_TYPE_PASSIVE;
         ext_scan_params.coded_cfg.scan_interval = 80;
-        ext_scan_params.coded_cfg.scan_window = 48;
+        ext_scan_params.coded_cfg.scan_window = 80;
 
         esp_err_t ret = esp_ble_gap_set_ext_scan_params(&ext_scan_params);
         if (ret == ESP_OK) {
@@ -520,12 +563,24 @@ void ble_pairing_init(void)
     }
 
     ESP_LOGI(TAG, "BLE pairing initialized, dev_name=%s", s_dev_name);
+
+    // 创建扫描停止同步信号量 (用于等待 BLE Controller 确认扫描停止)
+    if (!s_scan_stop_sem) {
+        s_scan_stop_sem = xSemaphoreCreateBinary();
+    }
 }
 
 void ble_pairing_deinit(void)
 {
     ble_pairing_stop_advertise();
     ble_pairing_stop_scan();
+
+    // 清理后处理定时器
+    if (s_post_scan_timer) {
+        xTimerStop(s_post_scan_timer, 0);
+        xTimerDelete(s_post_scan_timer, 0);
+        s_post_scan_timer = NULL;
+    }
 
     if (s_mutex) {
         vSemaphoreDelete(s_mutex);
@@ -564,7 +619,7 @@ bool ble_pairing_start_advertise(const char* device_name)
     esp_ble_gap_ext_adv_params_t ext_adv_params = {};
     ext_adv_params.type = ESP_BLE_GAP_SET_EXT_ADV_PROP_LEGACY_IND;
     ext_adv_params.interval_min = 160;
-    ext_adv_params.interval_max = 160;
+    ext_adv_params.interval_max = 200;
     ext_adv_params.channel_map = ADV_CHNL_ALL;
     ext_adv_params.own_addr_type = BLE_ADDR_TYPE_PUBLIC;
     ext_adv_params.primary_phy = ESP_BLE_GAP_PHY_1M;
@@ -594,24 +649,114 @@ bool ble_pairing_is_advertising(void)
     return s_advertising;
 }
 
-bool ble_pairing_start_scan(uint8_t duration_sec)
+// 扫描结束后批量处理所有发现的设备：add_peer + save_peers + send_pair_request
+// 在 BLE 扫描完全停止后才调用，避免 ESP-NOW 传输干扰 BLE 扫描
+static void ble_pairing_process_discovered(void)
 {
+    // 检查 ESP-NOW 是否已初始化，防止在角色关闭/解绑过程中执行 ESP-NOW 操作
+    if (!wifi_now_is_initialized()) {
+        ESP_LOGI(TAG, "Post-scan: ESP-NOW not initialized, skipping");
+        return;
+    }
+
+    if (s_discovered_count == 0) {
+        ESP_LOGI(TAG, "Post-scan: no devices discovered");
+        return;
+    }
+
+    ESP_LOGI(TAG, "Post-scan: processing %d discovered device(s)...", s_discovered_count);
+
+    int paired_count = 0;
+    for (int i = 0; i < s_discovered_count; i++) {
+        ble_discovered_device_t* dev = &s_discovered[i];
+
+        // 自动配对关闭或 Broadcast 角色时跳过
+        if (!s_auto_pair || role_control_get_role() == ROLE_BROADCAST) {
+            ESP_LOGI(TAG, "Post-scan: skip auto-pair for %s (auto=%d, role=%d)",
+                     dev->name, s_auto_pair, role_control_get_role());
+            continue;
+        }
+
+        bool already_paired = wifi_now_is_peer_cached(dev->now_mac);
+
+        if (already_paired) {
+            // 已配对设备重连：更新信道 + 发送配对回复
+            ESP_LOGI(TAG, "Post-scan rediscovery: %s (" MACSTR "), ch=%d",
+                     dev->name, MAC2STR(dev->now_mac), dev->channel);
+            wifi_now_add_peer_with_name(dev->now_mac, dev->channel, dev->name, dev->peer_type);
+            wifi_now_save_peers();
+            wifi_now_send_pair_response(dev->now_mac);
+            paired_count++;
+        } else {
+            // 全新设备：添加 peer + 保存 + 发送配对请求
+            uint8_t channel = (dev->channel != 0) ? dev->channel : wifi_now_get_channel();
+            bool added = wifi_now_add_peer_with_name(dev->now_mac, channel, dev->name, dev->peer_type);
+            if (added) {
+                ESP_LOGI(TAG, "Post-scan auto-pair: %s (" MACSTR "), ch=%d",
+                         dev->name, MAC2STR(dev->now_mac), channel);
+                wifi_now_save_peers();
+                wifi_now_send_pair_request(dev->now_mac);
+                paired_count++;
+            } else {
+                ESP_LOGW(TAG, "Post-scan add peer FAILED for %s", dev->name);
+            }
+        }
+    }
+
+    ESP_LOGI(TAG, "Post-scan result: %d/%d devices paired", paired_count, s_discovered_count);
+
+    // BLE burst 暂时禁用：经测试发现启动 burst 会导致 WiFi 不稳定，
+    // 使 web 服务器无响应。自动配对功能不受影响，SLave 可通过自身
+    // 广播来让 Master 发现（或通过 WEB 手动触发配对）。
+    // if (paired_count > 0 && !s_burst_mode && !s_advertising) {
+    //     TickType_t now = xTaskGetTickCount();
+    //     if (s_last_burst_ticks == 0 || now - s_last_burst_ticks > pdMS_TO_TICKS(15000)) {
+    //         vTaskDelay(pdMS_TO_TICKS(2000));
+    //         s_last_burst_ticks = xTaskGetTickCount();
+    //         ble_pairing_start_adv_burst(NULL, 5);
+    //     }
+    // }
+}
+
+bool ble_pairing_start_scan(uint16_t duration_sec)
+{
+    // 如果已经有扫描在运行，先停止（避免与上次的补扫状态冲突）
+    if (s_scanning) {
+        ESP_LOGI(TAG, "Scan already running, stopping first...");
+        ble_pairing_stop_scan();
+        vTaskDelay(pdMS_TO_TICKS(200));
+    }
+
+    // 停止并清理可能存在的后处理定时器
+    if (s_post_scan_timer) {
+        xTimerStop(s_post_scan_timer, 0);
+        xTimerDelete(s_post_scan_timer, 0);
+        s_post_scan_timer = NULL;
+    }
+
+    // 新扫描开始：重置补扫计数，清空发现的设备列表
+    s_scan_retries = 0;
+    s_adv_report_total = 0;
     xSemaphoreTake(s_scan_mutex, portMAX_DELAY);
     s_discovered_count = 0;
     memset(s_discovered, 0, sizeof(s_discovered));
+    memset(s_disc_time, 0, sizeof(s_disc_time));
     xSemaphoreGive(s_scan_mutex);
 
     esp_ble_ext_scan_params_t ext_scan_params = {};
     ext_scan_params.own_addr_type = BLE_ADDR_TYPE_PUBLIC;
     ext_scan_params.filter_policy = BLE_SCAN_FILTER_ALLOW_ALL;
-    ext_scan_params.scan_duplicate = BLE_SCAN_DUPLICATE_DISABLE;
+    ext_scan_params.scan_duplicate = BLE_SCAN_DUPLICATE_ENABLE;
     ext_scan_params.cfg_mask = ESP_BLE_GAP_EXT_SCAN_CFG_UNCODE_MASK;
+    // 使用主动扫描 (ACTIVE)：BLE controller 会发送 SCAN_REQ 给每个广告者，
+    // 收到 SCAN_RSP 后再上报给 host。这改变了 controller 内部状态机行为，
+    // 可能避免被动扫描中的交替丢失 bug。
     ext_scan_params.uncoded_cfg.scan_type = BLE_SCAN_TYPE_ACTIVE;
-    ext_scan_params.uncoded_cfg.scan_interval = 80;
-    ext_scan_params.uncoded_cfg.scan_window = 48;
+    ext_scan_params.uncoded_cfg.scan_interval = 160;
+    ext_scan_params.uncoded_cfg.scan_window = 80;  // 50% duty cycle: BLE 扫描占用一半天线时间，留给 WiFi 足够窗口
     ext_scan_params.coded_cfg.scan_type = BLE_SCAN_TYPE_ACTIVE;
-    ext_scan_params.coded_cfg.scan_interval = 80;
-    ext_scan_params.coded_cfg.scan_window = 48;
+    ext_scan_params.coded_cfg.scan_interval = 160;
+    ext_scan_params.coded_cfg.scan_window = 80;    // 50% duty cycle
 
     esp_err_t ret = esp_ble_gap_set_ext_scan_params(&ext_scan_params);
     if (ret != ESP_OK) {
@@ -619,8 +764,10 @@ bool ble_pairing_start_scan(uint8_t duration_sec)
         return false;
     }
 
-    uint32_t duration_ms = duration_sec * 1000;
-    ret = esp_ble_gap_start_ext_scan(duration_ms, 0);
+    // esp_ble_gap_start_ext_scan 的 duration 参数单位是 10ms（而非毫秒），
+    // 所以 15 秒扫描需要传入 15 * 100 = 1500（即 1500 * 10ms = 15000ms）
+    uint32_t duration_10ms = duration_sec * 100;
+    ret = esp_ble_gap_start_ext_scan(duration_10ms, 0);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Start scan failed: %d", ret);
         return false;
@@ -636,8 +783,21 @@ bool ble_pairing_start_scan(uint8_t duration_sec)
         xTimerStart(s_scan_timer, 0);
     }
 
-    ESP_LOGI(TAG, "Scan started, duration=%ds", duration_sec);
+    ESP_LOGI(TAG, "Scan started, duration=%ds (ACTIVE mode)", duration_sec);
     return true;
+}
+
+// 异步配对处理任务函数：在独立任务中处理发现的设备，不阻塞 HTTP 服务器
+static void deferred_process_task_func(void *arg)
+{
+    // 延迟 3 秒让 BLE controller 完全停止，WiFi MAC 恢复稳定后才操作 ESP-NOW
+    // 此延迟在独立任务中执行，不阻塞 FreeRTOS timer 任务（timer 任务阻塞会
+    // 阻止 WiFi 管理定时器，导致 web 服务器在 BLE 扫描后无响应）
+    vTaskDelay(pdMS_TO_TICKS(3000));
+    ESP_LOGI(TAG, "Deferred process task started");
+    ble_pairing_process_discovered();
+    ESP_LOGI(TAG, "Deferred process task finished");
+    vTaskDelete(NULL);
 }
 
 void ble_pairing_stop_scan(void)
@@ -650,9 +810,36 @@ void ble_pairing_stop_scan(void)
         s_scan_timer = NULL;
     }
 
+    // 先消费残留的信号量（防止前一次超时留下的信号干扰）
+    xSemaphoreTake(s_scan_stop_sem, 0);
+
     esp_ble_gap_stop_ext_scan();
-    s_scanning = false;
-    ESP_LOGI(TAG, "Scan stopped");
+
+    // 同步等待 BLE Controller 确认扫描停止，避免下次启动时状态冲突
+    // SCAN_STOP_COMPLETE_EVT 会 give semaphore 并启动 post_scan_timer
+    if (xSemaphoreTake(s_scan_stop_sem, pdMS_TO_TICKS(2000)) == pdTRUE) {
+        ESP_LOGI(TAG, "Scan stop confirmed by controller");
+    } else {
+        ESP_LOGW(TAG, "Scan stop timeout - forcing stop, starting post-scan manually");
+        s_scanning = false;
+        // BLE controller 未响应 stop 时，手动触发后处理逻辑
+        // 避免 auto-pair 因 SCAN_STOP_COMPLETE_EVT 丢失而永远不执行
+        if (s_post_scan_timer) {
+            xTimerReset(s_post_scan_timer, 0);
+        } else {
+            s_post_scan_timer = xTimerCreate("post_scan",
+                                              pdMS_TO_TICKS(100),
+                                              pdFALSE, NULL, post_scan_timer_callback);
+            if (s_post_scan_timer) {
+                xTimerStart(s_post_scan_timer, 0);
+            }
+        }
+    }
+
+    // 处理逻辑（补扫 / 创建处理任务）移至 post_scan_timer_callback。
+    // post_scan_timer 由 SCAN_STOP_COMPLETE_EVT 启动 100ms 后触发。
+    // 补扫受 s_scan_retries 上限约束，最多 MAX_SCAN_RETRIES 次。
+    // ble_pairing_start_scan() 在新扫描前停止补扫并重置 retries。
 }
 
 bool ble_pairing_is_scanning(void)
@@ -695,8 +882,11 @@ bool ble_pairing_pair_with_device(int index)
         ESP_LOGI(TAG, "Paired with %s, NOW_MAC=" MACSTR,
                  name, MAC2STR(now_mac));
         wifi_now_save_peers();
-        // 发送配对请求，将本机 PMK 同步给对端
-        wifi_now_send_pair_request(now_mac);
+        // 多次发送配对请求，将本机 PMK 同步给对端，确保对端在BLE广播间隙能收到
+        for (int _r = 0; _r < 5; _r++) {
+            wifi_now_send_pair_request(now_mac);
+            vTaskDelay(pdMS_TO_TICKS(20));
+        }
     }
     return ok;
 }
@@ -740,4 +930,70 @@ bool ble_pairing_set_name(const char* name)
 
     ESP_LOGI(TAG, "Device name set to '%s'", s_dev_name);
     return true;
+}
+
+// 复位 BLE controller：disable + enable Bluedroid + BT controller
+// vs 全 deinit/init 已被验证不可行（在 Wi-Fi 激活时完全破坏 BLE 堆栈）
+// disable/enable 后，GAP callback 仍然有效，无需重新注册。
+// 注意：必须在扫描/广告完全停止后再调用。
+void ble_pairing_reset_controller(void)
+{
+    // 确保所有 BLE 操作已停止
+    if (s_advertising) {
+        ble_pairing_stop_advertise();
+    }
+    if (s_scanning) {
+        ble_pairing_stop_scan();
+    }
+
+    // 清理后处理定时器
+    if (s_post_scan_timer) {
+        xTimerStop(s_post_scan_timer, 0);
+        xTimerDelete(s_post_scan_timer, 0);
+        s_post_scan_timer = NULL;
+    }
+    vTaskDelay(pdMS_TO_TICKS(100));
+
+    // 清理信号量残留
+    xSemaphoreTake(s_scan_stop_sem, 0);
+
+    ESP_LOGI(TAG, "BLE controller reset (disable/enable)...");
+
+    // 1. Disable Bluedroid
+    esp_err_t ret = esp_bluedroid_disable();
+    ESP_LOGI(TAG, "  [1/4] esp_bluedroid_disable  = %d", ret);
+    vTaskDelay(pdMS_TO_TICKS(50));
+
+    // 2. Disable BT controller
+    ret = esp_bt_controller_disable();
+    ESP_LOGI(TAG, "  [2/4] esp_bt_controller_disable = %d", ret);
+    vTaskDelay(pdMS_TO_TICKS(50));
+
+    // 3. Re-enable BT controller
+    ret = esp_bt_controller_enable(ESP_BT_MODE_BLE);
+    ESP_LOGI(TAG, "  [3/4] esp_bt_controller_enable  = %d", ret);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "BT re-enable failed!");
+        return;
+    }
+    vTaskDelay(pdMS_TO_TICKS(50));
+
+    // 4. Re-enable Bluedroid
+    ret = esp_bluedroid_enable();
+    ESP_LOGI(TAG, "  [4/4] esp_bluedroid_enable    = %d", ret);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Bluedroid re-enable failed!");
+        return;
+    }
+    vTaskDelay(pdMS_TO_TICKS(50));
+
+    // GAP callback 在 disable/enable 后仍然有效
+
+    // 重置状态
+    s_scanning = false;
+    s_advertising = false;
+    s_burst_mode = false;
+    s_scan_retries = 0;
+
+    ESP_LOGI(TAG, "BLE controller reset complete");
 }

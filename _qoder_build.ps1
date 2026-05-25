@@ -5,6 +5,7 @@ Remove-Item Env:MINGW -ErrorAction SilentlyContinue
 
 $env:IDF_PATH = 'C:\ESP-IDF\v6.0.1\esp-idf'
 $env:IDF_TOOLS_PATH = 'C:\Espressif'
+$env:ESP_IDF_VERSION = '6.0.1'
 $env:PATH = 'C:\Espressif\python_env\idf6.0.1_py3.13_env\Scripts;C:\Espressif\tools\xtensa-esp-elf\esp-15.2.0_20251204\xtensa-esp-elf\bin;' + $env:PATH
 
 Set-Location 'D:\develop\ESP32\S3\wifi\wifi_esp32'

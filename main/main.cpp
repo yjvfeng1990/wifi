@@ -24,6 +24,10 @@ extern "C" void app_main(void)
     ESP_LOGI(TAG, "  ESP32-S3 USB WiFi Manager Starting");
     ESP_LOGI(TAG, "========================================");
 
+    // 压制 WiFi 固件的 802.11 Block ACK 高频日志（tid/ssn/winSize 消息），
+    // 避免在 WiFi 连接频繁变更时串口泛洪导致 web server 无响应。
+    esp_log_level_set("wifi", ESP_LOG_WARN);
+
     wifi_service_init();
 
     wifi_op_mode_t mode = wifi_service_get_mode();
@@ -79,9 +83,15 @@ extern "C" void app_main(void)
         ESP_LOGI(TAG, "AP+STA dual mode active");
     }
 
-    // 自动启动角色动作
-    if (role_control_get_role() != ROLE_OFF) {
-        ESP_LOGI(TAG, "Role is configured, auto-starting...");
+    // SLAVE / MASTER 自动启动：
+    // - SLAVE (ROLE_BROADCAST): 自动启动 BLE 广播，让 MASTER 通过 BLE 扫描发现
+    // - MASTER (ROLE_RECEIVE):  自动启动 BLE 扫描，发现并配对附近的 SLAVE 设备
+    // WiFi STA 需要先连接路由器获取 IP 和稳定信道后，才能安全启动 BLE。
+    role_type_t start_role = role_control_get_role();
+    if (start_role == ROLE_BROADCAST || start_role == ROLE_RECEIVE) {
+        const char* role_name = (start_role == ROLE_BROADCAST) ? "SLAVE" : "MASTER";
+        ESP_LOGI(TAG, "%s role detected, auto-starting in 8s...", role_name);
+        vTaskDelay(pdMS_TO_TICKS(8000));
         role_control_start();
     }
 
@@ -92,4 +102,11 @@ extern "C" void app_main(void)
         ESP_LOGI(TAG, "  AP WiFi:     http://192.168.4.1");
     }
     ESP_LOGI(TAG, "========================================");
+
+    // 永真循环：阻止 app_main() 返回，避免 ESP-IDF 框架持续打印
+    // "main_task: Returned from app_main()" 串口消息，该泛洪会占用大量
+    // CPU 时间导致 HTTP 服务器响应退化到分钟级。
+    for (;;) {
+        vTaskDelay(pdMS_TO_TICKS(60000));
+    }
 }

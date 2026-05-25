@@ -21,6 +21,7 @@ extern "C" {
 #define ESP_NOW_MSG_UNPAIR_REQUEST  0x03
 #define ESP_NOW_MSG_UNPAIR_RESPONSE 0x04
 #define ESP_NOW_MSG_ACK            0x05
+#define ESP_NOW_MSG_UNBIND_ALL     0x06
 #define ESP_NOW_MSG_DATA           0x10
 
 #define ESP_NOW_RECV_HISTORY_MAX   20
@@ -96,6 +97,7 @@ bool wifi_now_add_peer_with_name(const uint8_t* mac_addr, uint8_t channel,
 bool wifi_now_remove_peer(const uint8_t* mac_addr);
 int  wifi_now_get_peer_count(void);
 bool wifi_now_is_peer_exists(const uint8_t* mac_addr);
+bool wifi_now_is_peer_cached(const uint8_t* mac_addr);
 void wifi_now_clear_peers(void);
 
 int  wifi_now_get_peer_list(wifi_now_peer_info_t* peers, int max_count);
@@ -135,6 +137,10 @@ bool wifi_now_send_unpair_response(const uint8_t* dest_mac);
 bool wifi_now_handle_unpair_message(const uint8_t* mac_addr, const uint8_t* data, int len);
 bool wifi_now_unpair_with_peer(const uint8_t* mac_addr);
 void wifi_now_set_unpair_callback(wifi_now_unpair_cb_t cb);
+
+// 一键解绑: 通知所有对端清空peer list, 同时清空本地peer list
+bool wifi_now_unbind_all(void);
+bool wifi_now_handle_unbind_all_message(const uint8_t* mac_addr, const uint8_t* data, int len);
 
 // 接收消息历史
 bool wifi_now_add_recv_entry(const uint8_t* mac, const uint8_t* data, int len);

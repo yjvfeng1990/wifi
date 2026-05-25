@@ -35,11 +35,11 @@ ble_pair_state_t ble_pairing_get_state(void);
 bool ble_pairing_start_advertise(const char* device_name);
 void ble_pairing_stop_advertise(void);
 bool ble_pairing_is_advertising(void);
-bool ble_pairing_start_adv_burst(const char* device_name, uint8_t duration_sec);
+bool ble_pairing_start_adv_burst(const char* device_name, uint16_t duration_sec);
 void ble_pairing_stop_adv_burst(void);
 bool ble_pairing_is_burst_mode(void);
 
-bool ble_pairing_start_scan(uint8_t duration_sec);
+bool ble_pairing_start_scan(uint16_t duration_sec);
 void ble_pairing_stop_scan(void);
 bool ble_pairing_is_scanning(void);
 
@@ -53,6 +53,10 @@ uint8_t* ble_pairing_get_own_now_mac(void);
 
 void ble_pairing_get_name(char* name_out);
 bool ble_pairing_set_name(const char* name);
+
+// BLE controller 硬复位：disable/enable 整个 BT controller
+// 用于清除 ESP32-S3 BLE controller 内部状态机的交替丢失 bug
+void ble_pairing_reset_controller(void);
 
 #ifdef __cplusplus
 }

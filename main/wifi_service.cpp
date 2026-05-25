@@ -239,7 +239,7 @@ static void napt_callback(void* ctx)
     napt_cb_ctx_t* c = (napt_cb_ctx_t*)ctx;
     if (c && c->nif) {
         ip_napt_enable_netif(c->nif, c->enable);
-        ESP_LOGI(TAG, "NAPT: %s on %c%c%d",
+        ESP_LOGD(TAG, "NAPT: %s on %c%c%d",
                  c->enable ? "enabled" : "disabled",
                  c->nif->name[0], c->nif->name[1], c->nif->num);
     }
@@ -279,12 +279,17 @@ static void disable_napt_for_netif(esp_netif_t* esp_netif)
 
 static void enable_napt(void)
 {
+    // 防止 STA 重连事件反复调用导致串口泛洪
+    if (s_napt_enabled) {
+        return;
+    }
+
     esp_netif_t* usb_netif = usb_network_get_netif();
     enable_napt_for_netif(usb_netif);
     enable_napt_for_netif(s_ap_netif);
 
     s_napt_enabled = true;
-    ESP_LOGI(TAG, "NAPT enabled: WiFi STA -> USB+AP sharing active");
+    ESP_LOGD(TAG, "NAPT enabled: WiFi STA -> USB+AP sharing active");
 }
 
 static void disable_napt(void)
@@ -481,7 +486,8 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base,
             wifi_event_ap_stadisconnected_t* event =
                 (wifi_event_ap_stadisconnected_t*)event_data;
             xSemaphoreTake(s_status_mutex, portMAX_DELAY);
-            int clients = --s_ap_clients;
+            if (s_ap_clients > 0) s_ap_clients--;
+            int clients = s_ap_clients;
             xSemaphoreGive(s_status_mutex);
             ESP_LOGI(TAG, "AP client disconnected: " MACSTR ", total: %d",
                      MAC2STR(event->mac), clients);
@@ -538,7 +544,7 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base,
 
             if (s_napt_enabled) {
                 enable_napt_for_netif(s_ap_netif);
-                ESP_LOGI(TAG, "NAPT re-applied for AP netif");
+                ESP_LOGD(TAG, "NAPT re-applied for AP netif");
             }
             break;
 
@@ -590,7 +596,7 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base,
             }
             xSemaphoreGive(s_dhcp_mutex);
 
-            ESP_LOGI(TAG, "DHCP assigned: " MACSTR " -> " IPSTR " (%s)",
+            ESP_LOGD(TAG, "DHCP assigned: " MACSTR " -> " IPSTR " (%s)",
                      MAC2STR(evt->mac), IP2STR(&evt->ip),
                      (evt->esp_netif == s_ap_netif) ? "AP" : "USB");
         }
@@ -681,8 +687,17 @@ void wifi_service_init(void)
         break;
     case WIFI_OP_MODE_STA:
     default:
-        s_sta_active = true;
-        s_ap_active  = false;
+        // 无已保存的 WiFi 凭据时，默认使用 AP 模式以便通过 Web UI 配网
+        // 这对于没有 USB CDC ECM（如 CH343 串口）的设备是必要的
+        if (!wifi_service_has_config()) {
+            s_sta_active = false;
+            s_ap_active  = true;
+            saved_mode = WIFI_OP_MODE_AP;
+            ESP_LOGW(TAG, "No saved WiFi config, falling back to AP mode (SSID=%s)", s_ap_ssid);
+        } else {
+            s_sta_active = true;
+            s_ap_active  = false;
+        }
         break;
     }
 

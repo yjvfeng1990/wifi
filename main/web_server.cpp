@@ -112,6 +112,8 @@ static esp_err_t root_get_handler(httpd_req_t* req)
         .dhcp-table td{padding:clamp(6px,2vw,10px) clamp(8px,2.5vw,12px);border-bottom:1px solid rgba(255,255,255,0.03);font-family:monospace;word-break:break-all}
         .dhcp-table tr:hover{background:rgba(255,255,255,0.02)}
         .dhcp-empty{text-align:center;color:#555;padding:clamp(12px,3vw,20px);font-size:clamp(11px,2.5vw,13px)}
+        .peer-discovering td{color:#8892b0}
+        .peer-discovering .badge-discovering{display:inline-block;padding:1px 6px;border-radius:10px;font-size:10px;background:rgba(255,170,0,0.15);color:#ffaa00;margin-left:4px;vertical-align:middle}
         .dhcp-badge{display:inline-block;padding:2px 6px;border-radius:10px;font-size:clamp(8px,2vw,10px);font-weight:600}
         .dhcp-badge-ap{background:rgba(0,200,255,0.15);color:#00c8ff}
         .dhcp-badge-usb{background:rgba(255,170,0,0.15);color:#ffaa00}
@@ -342,6 +344,7 @@ static esp_err_t root_get_handler(httpd_req_t* req)
             <div id="peerTableContainer">
                 <div class="dhcp-empty">No peers paired</div>
             </div>
+            <button id="unbindAllBtn" class="btn btn-danger" onclick="unbindAll()" style="display:none;margin-top:12px">Unbind All Peers</button>
         </div>
 
         <div class="card">
@@ -480,7 +483,13 @@ static esp_err_t root_get_handler(httpd_req_t* req)
             else el.style.color='#8892b0';
         }
 
+        var formInitialized = false;
+
         function updateUI(d){
+            if(!formInitialized){
+                initFormFields(d);
+                formInitialized = true;
+            }
             var staState=d.sta_state||'disconnected';
             document.getElementById('staState').textContent=
                 staState==='connected'?'Connected':
@@ -539,14 +548,17 @@ static esp_err_t root_get_handler(httpd_req_t* req)
             updThr('usbRX',d.usb_down_bps||0,'usbRXbar');
             updThr('usbTX',d.usb_up_bps||0,'usbTXbar');
 
+        }
+
+        function initFormFields(d){
             var elSsid=document.getElementById('ssid');
             var elPass=document.getElementById('password');
-            if(d.sta_ssid && !elSsid.value)elSsid.value=d.sta_ssid;
-            if(d.sta_password && !elPass.value)elPass.value=d.sta_password;
+            if(d.sta_ssid)elSsid.value=d.sta_ssid;
+            if(d.sta_password)elPass.value=d.sta_password;
             var elApSsid=document.getElementById('apSsid');
             var elApPass=document.getElementById('apPassword');
-            if(d.ap_ssid && !elApSsid.value)elApSsid.value=d.ap_ssid;
-            if(d.ap_password && !elApPass.value)elApPass.value=d.ap_password;
+            if(d.ap_ssid)elApSsid.value=d.ap_ssid;
+            if(d.ap_password)elApPass.value=d.ap_password;
         }
 
         function updateStatus(){
@@ -698,28 +710,75 @@ static esp_err_t root_get_handler(httpd_req_t* req)
         }
 
         function updateNowPeers(){
-            fetch('/api/now/peers').then(function(r){return r.json()}).then(function(data){
-                var container=document.getElementById('peerTableContainer');
-                if(!data||data.length===0){
-                    container.innerHTML='<div class="dhcp-empty">No peers paired</div>';
-                    return;
+            fetch('/api/now/peers').then(function(r){return r.json()}).then(function(paired){
+                fetch('/api/ble/devices').then(function(r2){return r2.json()}).then(function(bleData){
+                    renderPeerTable(paired, bleData);
+                }).catch(function(){
+                    renderPeerTable(paired, null);
+                });
+            });
+        }
+
+        function renderPeerTable(paired, bleData){
+            var container=document.getElementById('peerTableContainer');
+            var pairedMacs={};
+            var hasPaired=paired&&paired.length>0;
+            if(hasPaired){
+                for(var i=0;i<paired.length;i++) pairedMacs[paired[i].mac]=true;
+            }
+            var discovering=[];
+            var hasDiscovering=false;
+            if(bleData&&bleData.devices){
+                for(var i=0;i<bleData.devices.length;i++){
+                    var d=bleData.devices[i];
+                    if(!pairedMacs[d.now_mac]) discovering.push(d);
                 }
-                var html='<table class="dhcp-table"><thead><tr><th>Name</th><th>MAC Address</th><th>Channel</th><th>Type</th><th>Action</th></tr></thead><tbody>';
-                for(var i=0;i<data.length;i++){
-                    var p=data[i];
-                    var peerType=p.type||'WiFi';
-                    html+='<tr><td>'+p.name+'</td><td>'+p.mac+'</td><td>'+p.channel+'</td><td>'+peerType+'</td>';
+                hasDiscovering=discovering.length>0;
+            }
+            if(!hasPaired&&!hasDiscovering){
+                container.innerHTML='<div class="dhcp-empty">No peers</div>';
+                return;
+            }
+            var html='<table class="dhcp-table"><thead><tr><th>Name</th><th>MAC Address</th><th>Channel</th><th>Type</th><th>Action</th></tr></thead><tbody>';
+            if(hasPaired){
+                for(var i=0;i<paired.length;i++){
+                    var p=paired[i];
+                    html+='<tr><td>'+p.name+'</td><td>'+p.mac+'</td><td>'+(p.channel||'--')+'</td><td>'+(p.type||'WiFi')+'</td>';
                     html+='<td><button class="btn-mini" onclick="removePeer(\''+p.mac+'\')">Remove</button></td></tr>';
                 }
-                html+='</tbody></table>';
-                container.innerHTML=html;
-            });
+            }
+            if(hasDiscovering){
+                for(var i=0;i<discovering.length;i++){
+                    var d=discovering[i];
+                    html+='<tr class="peer-discovering"><td>'+d.name+'<span class="badge-discovering">discovering</span></td>';
+                    html+='<td>'+d.now_mac+'</td><td>--</td><td>BLE</td>';
+                    html+='<td><span style="color:#555;font-size:11px">scanning...</span></td></tr>';
+                }
+            }
+            html+='</tbody></table>';
+            container.innerHTML=html;
         }
 
         function removePeer(mac){
             fetch('/api/now/peer/remove',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'mac='+encodeURIComponent(mac)}).then(function(r){return r.json()}).then(function(){
                 showToast('Peer removed','success');
                 updateNowPeers();
+            });
+        }
+
+        function unbindAll(){
+            if(!confirm('Unbind all peers? This will clear peer lists on both Master and all Slave devices.'))return;
+            var btn=document.getElementById('unbindAllBtn');
+            btn.disabled=true;
+            btn.textContent='Unbinding...';
+            fetch('/api/espnow/unbind-all',{method:'POST'}).then(function(r){return r.json()}).then(function(d){
+                showToast(d.success?'All peers unbound':'Unbind failed',d.success?'success':'error');
+                updateNowPeers();
+            }).catch(function(){
+                showToast('Request failed','error');
+            }).finally(function(){
+                btn.disabled=false;
+                btn.textContent='Unbind All Peers';
             });
         }
 
@@ -1365,7 +1424,9 @@ static esp_err_t root_get_handler(httpd_req_t* req)
                 document.getElementById('roleRemaining').textContent=d.remaining+'s';
                 document.getElementById('rolePeers').textContent=d.peers;
                 document.getElementById('roleStartBtn').disabled=(d.role==0||d.state!=='IDLE');
-                document.getElementById('roleStopBtn').disabled=(d.state!=='ACTIVE');
+                document.getElementById('roleStopBtn').disabled=(d.role==0||d.state==='IDLE');
+                var unbindBtn=document.getElementById('unbindAllBtn');
+                if(unbindBtn) unbindBtn.style.display=(d.role==2)?'block':'none';
             }).catch(function(){});
         }
 
@@ -1768,7 +1829,19 @@ static esp_err_t api_ble_name_set_handler(httpd_req_t* req)
 
 static esp_err_t api_ble_scan_handler(httpd_req_t* req)
 {
-    ble_pairing_start_scan(10);
+    // 从 POST body 读取可选的 duration 参数（默认 10 秒）
+    uint16_t duration = 10;
+    char buf[64] = {0};
+    int ret = httpd_req_recv(req, buf, sizeof(buf) - 1);
+    if (ret > 0) {
+        buf[ret] = '\0';
+        char* dur = strstr(buf, "duration=");
+        if (dur) {
+            int val = atoi(dur + 9);
+            if (val >= 1 && val <= 120) duration = (uint16_t)val;
+        }
+    }
+    ble_pairing_start_scan(duration);
     httpd_resp_set_type(req, "application/json; charset=utf-8");
     httpd_resp_send(req, "{\"success\":true}", HTTPD_RESP_USE_STRLEN);
     return ESP_OK;
@@ -2099,6 +2172,29 @@ static esp_err_t api_espnow_unpair_handler(httpd_req_t* req)
     return ESP_OK;
 }
 
+static esp_err_t api_espnow_unbind_all_handler(httpd_req_t* req)
+{
+    ESP_LOGI(TAG, "Unbind-all request received");
+
+    bool ok = wifi_now_unbind_all();
+
+    // 完全重置 ESP-NOW 驱动状态，消除交替周期性干扰
+    // wifi_now_deinit() 会调用 esp_now_deinit() 清理内部状态
+    // wifi_now_init() 重新初始化驱动，确保下次 BLE 扫描时处于干净状态
+    if (ok) {
+        ESP_LOGI(TAG, "Reinitializing ESP-NOW driver to clear residual state...");
+        wifi_now_deinit();
+        vTaskDelay(pdMS_TO_TICKS(100));
+        wifi_now_init();
+    }
+
+    char buf[128];
+    snprintf(buf, sizeof(buf), "{\"success\":%s}", ok ? "true" : "false");
+    httpd_resp_set_type(req, "application/json; charset=utf-8");
+    httpd_resp_send(req, buf, strlen(buf));
+    return ESP_OK;
+}
+
 static esp_err_t api_espnow_send_handler(httpd_req_t* req)
 {
     char buf[1024] = {0};
@@ -2147,7 +2243,7 @@ static esp_err_t api_espnow_send_handler(httpd_req_t* req)
         if (data_str) {
             data_str++;
             while (*data_str && (*data_str == ' ' || *data_str == '"')) data_str++;
-            char* end = strrchr(data_str, '"');
+            char* end = strchr(data_str, '"');
             if (end) {
                 *end = '\0';
                 data = data_str;
@@ -2164,7 +2260,10 @@ static esp_err_t api_espnow_send_handler(httpd_req_t* req)
             bin_len = data_len;
             memcpy(bin_buf, data, bin_len);
         } else {
-            bin_len = hex_decode(data, bin_buf, sizeof(bin_buf));
+            // hex类型：不解码，直接将hex字符串作为数据发送
+            int hex_str_len = strlen(data);
+            bin_len = (hex_str_len > (int)sizeof(bin_buf)) ? (int)sizeof(bin_buf) : hex_str_len;
+            memcpy(bin_buf, data, bin_len);
         }
     }
 
@@ -2202,12 +2301,42 @@ static esp_err_t api_espnow_send_handler(httpd_req_t* req)
 static esp_err_t api_espnow_broadcast_handler(httpd_req_t* req)
 {
     char buf[1024] = {0};
-    int ret = httpd_req_recv(req, buf, sizeof(buf) - 1);
-    if (ret <= 0) {
-        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Failed to receive data");
+
+    // Get Content-Length to know how much data to read
+    char cl_str[16] = {0};
+    int content_len = 0;
+    if (httpd_req_get_hdr_value_str(req, "Content-Length", cl_str, sizeof(cl_str)) == ESP_OK) {
+        content_len = atoi(cl_str);
+    }
+
+    // Reject if body is too large for our buffer
+    if (content_len >= (int)sizeof(buf)) {
+        httpd_resp_send_err(req, HTTPD_413_CONTENT_TOO_LARGE, "Request body too large");
         return ESP_FAIL;
     }
-    buf[ret] = '\0';
+
+    int total_read = 0;
+    int to_read = (content_len > 0) ? content_len : (int)sizeof(buf) - 1;
+
+    // Loop to handle chunked TCP reception
+    while (total_read < to_read) {
+        int ret = httpd_req_recv(req, buf + total_read, to_read - total_read);
+        if (ret < 0) {
+            if (ret == HTTPD_SOCK_ERR_TIMEOUT) {
+                continue; // retry on timeout
+            }
+            ESP_LOGE(TAG, "Failed to receive POST body: %d", ret);
+            httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Failed to receive data");
+            return ESP_FAIL;
+        }
+        if (ret == 0) {
+            break; // connection closed
+        }
+        total_read += ret;
+    }
+    buf[total_read] = '\0';
+
+    ESP_LOGI(TAG, "Broadcast request body received: %d bytes", total_read);
 
     char* data = NULL;
     int data_len = 0;
@@ -2231,7 +2360,7 @@ static esp_err_t api_espnow_broadcast_handler(httpd_req_t* req)
         if (data_str) {
             data_str++;
             while (*data_str && (*data_str == ' ' || *data_str == '"')) data_str++;
-            char* end = strrchr(data_str, '"');
+            char* end = strchr(data_str, '"');
             if (end) {
                 *end = '\0';
                 data = data_str;
@@ -2248,7 +2377,10 @@ static esp_err_t api_espnow_broadcast_handler(httpd_req_t* req)
             bin_len = data_len;
             memcpy(bin_buf, data, bin_len);
         } else {
-            bin_len = hex_decode(data, bin_buf, sizeof(bin_buf));
+            // hex类型：不解码，直接将hex字符串作为数据发送
+            int hex_str_len = strlen(data);
+            bin_len = (hex_str_len > (int)sizeof(bin_buf)) ? (int)sizeof(bin_buf) : hex_str_len;
+            memcpy(bin_buf, data, bin_len);
         }
     }
 
@@ -2256,7 +2388,7 @@ static esp_err_t api_espnow_broadcast_handler(httpd_req_t* req)
     int sent_len = 0;
 
     if (bin_len > 0) {
-        ESP_LOGI(TAG, "Broadcasting ESP-NOW data (len=%d)", bin_len);
+        ESP_LOGI(TAG, "Broadcasting ESP-NOW data (len=%d, hex_string=%.*s)", bin_len, bin_len > 50 ? 50 : bin_len, bin_buf);
 
         sent_len = wifi_now_broadcast(bin_buf, bin_len);
         if (sent_len == 0) {
@@ -2709,11 +2841,19 @@ static esp_err_t api_espnow_role_handler(httpd_req_t* req)
 
 static esp_err_t api_espnow_role_status_handler(httpd_req_t* req)
 {
-    char buf[128];
+    char buf[160];
+    const char* ble_state;
+    if (ble_pairing_is_scanning()) {
+        ble_state = "SCANNING";
+    } else if (ble_pairing_is_advertising() || ble_pairing_is_burst_mode()) {
+        ble_state = "ADVERTISING";
+    } else {
+        ble_state = "IDLE";
+    }
     snprintf(buf, sizeof(buf),
              "{\"role\":%d,\"state\":\"%s\",\"remaining\":%d,\"peers\":%d}",
              (int)role_control_get_role(),
-             role_control_get_state() == ROLE_STATE_ACTIVE ? "ACTIVE" : "IDLE",
+             ble_state,
              role_control_get_remaining(),
              role_control_get_peer_count());
     httpd_resp_set_type(req, "application/json; charset=utf-8");
@@ -2723,21 +2863,55 @@ static esp_err_t api_espnow_role_status_handler(httpd_req_t* req)
 
 static esp_err_t api_espnow_role_start_handler(httpd_req_t* req)
 {
-    bool ok = role_control_start();
-    char buf[64];
-    snprintf(buf, sizeof(buf), "{\"success\":%s}", ok ? "true" : "false");
+    role_type_t role = role_control_get_role();
+    if (role == ROLE_OFF) {
+        httpd_resp_set_type(req, "application/json; charset=utf-8");
+        httpd_resp_send(req, "{\"success\":false,\"error\":\"role_off\"}", HTTPD_RESP_USE_STRLEN);
+        return ESP_OK;
+    }
+
+    // Start BLE operations based on role (does not change role state)
+    if (role == ROLE_RECEIVE) {
+        ble_pairing_set_auto_pair(true);
+        ble_pairing_start_scan(60);
+        ESP_LOGI(TAG, "API: BLE scan started (Master)");
+    } else {
+        ble_pairing_set_auto_pair(true);
+        ble_pairing_start_advertise(NULL);
+        ESP_LOGI(TAG, "API: BLE advertise started (Slave)");
+    }
+
+    // Reset display timer so remaining starts from 60s
+    role_control_reset_timer();
+
     httpd_resp_set_type(req, "application/json; charset=utf-8");
-    httpd_resp_send(req, buf, strlen(buf));
-    ESP_LOGI(TAG, "Role start via API: %s", ok ? "OK" : "FAIL");
+    httpd_resp_send(req, "{\"success\":true}", HTTPD_RESP_USE_STRLEN);
     return ESP_OK;
 }
 
 static esp_err_t api_espnow_role_stop_handler(httpd_req_t* req)
 {
-    role_control_stop();
+    bool stopped = false;
+    if (ble_pairing_is_scanning()) {
+        ble_pairing_stop_scan();
+        stopped = true;
+        ESP_LOGI(TAG, "API: BLE scan stopped");
+    }
+    if (ble_pairing_is_advertising()) {
+        ble_pairing_stop_advertise();
+        stopped = true;
+        ESP_LOGI(TAG, "API: BLE advertise stopped");
+    }
+    if (ble_pairing_is_burst_mode()) {
+        ble_pairing_stop_adv_burst();
+        stopped = true;
+    }
+    if (!stopped) {
+        ESP_LOGI(TAG, "API: BLE stop (nothing running)");
+    }
+
     httpd_resp_set_type(req, "application/json; charset=utf-8");
     httpd_resp_send(req, "{\"success\":true}", HTTPD_RESP_USE_STRLEN);
-    ESP_LOGI(TAG, "Role stop via API");
     return ESP_OK;
 }
 
@@ -2831,6 +3005,7 @@ void web_server_start(WebServer* ws)
     httpd_uri_t espnow_reg_uri  = { .uri = "/api/espnow/register", .method = HTTP_POST, .handler = api_espnow_register_handler, .user_ctx = NULL };
     httpd_uri_t espnow_master_uri = { .uri = "/api/espnow/master", .method = HTTP_GET, .handler = api_espnow_master_handler, .user_ctx = NULL };
     httpd_uri_t espnow_unpair_uri = { .uri = "/api/espnow/unpair", .method = HTTP_POST, .handler = api_espnow_unpair_handler, .user_ctx = NULL };
+    httpd_uri_t espnow_unbind_all_uri = { .uri = "/api/espnow/unbind-all", .method = HTTP_POST, .handler = api_espnow_unbind_all_handler, .user_ctx = NULL };
     httpd_uri_t espnow_send_uri = { .uri = "/api/espnow/send", .method = HTTP_POST, .handler = api_espnow_send_handler, .user_ctx = NULL };
     httpd_uri_t espnow_broadcast_uri = { .uri = "/api/espnow/broadcast", .method = HTTP_POST, .handler = api_espnow_broadcast_handler, .user_ctx = NULL };
     httpd_uri_t espnow_templates_uri = { .uri = "/api/espnow/templates", .method = HTTP_GET, .handler = api_espnow_templates_get_handler, .user_ctx = NULL };
@@ -2871,6 +3046,7 @@ void web_server_start(WebServer* ws)
         httpd_register_uri_handler(ws->server, &espnow_reg_uri);
         httpd_register_uri_handler(ws->server, &espnow_master_uri);
         httpd_register_uri_handler(ws->server, &espnow_unpair_uri);
+        httpd_register_uri_handler(ws->server, &espnow_unbind_all_uri);
         httpd_register_uri_handler(ws->server, &espnow_send_uri);
         httpd_register_uri_handler(ws->server, &espnow_broadcast_uri);
         httpd_register_uri_handler(ws->server, &espnow_templates_uri);

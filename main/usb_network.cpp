@@ -152,11 +152,11 @@ static void ncm_init_callback(void* ctx)
 static void usb_device_event_handler(tinyusb_event_t *event, void *arg)
 {
     if (event->id == TINYUSB_EVENT_ATTACHED) {
-        ESP_LOGI(TAG, "USB attached");
+        ESP_LOGD(TAG, "USB attached");
         s_usb_attached = true;
         s_usb_suspended = false;
     } else if (event->id == TINYUSB_EVENT_DETACHED) {
-        ESP_LOGI(TAG, "USB detached");
+        ESP_LOGD(TAG, "USB detached");
         s_usb_attached = false;
         s_usb_suspended = false;
     }

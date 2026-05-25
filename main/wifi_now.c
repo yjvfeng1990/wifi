@@ -122,13 +122,16 @@ static void espnow_recv_cb(const esp_now_recv_info_t* info,
     }
     ESP_LOGI(TAG, "Recv %d bytes: %s", data_len, hex_dump);
 
-    // 检查是否为配对/解绑控制消息
+    // 检查是否为配对/解绑/一键解绑控制消息
     bool is_control_msg = false;
     if (data_len >= (int)sizeof(esp_now_pair_msg_t)) {
         if (wifi_now_handle_pair_message(info->src_addr, data, data_len)) {
             is_control_msg = true;
         }
         if (wifi_now_handle_unpair_message(info->src_addr, data, data_len)) {
+            is_control_msg = true;
+        }
+        if (wifi_now_handle_unbind_all_message(info->src_addr, data, data_len)) {
             is_control_msg = true;
         }
     }
@@ -142,12 +145,15 @@ static void espnow_recv_cb(const esp_now_recv_info_t* info,
 
         // 自动将未知发送方添加为peer（确保双向通信）
         if (!wifi_now_is_peer_exists(info->src_addr)) {
-            ESP_LOGI(TAG, "Auto-adding unknown sender as peer: " MACSTR,
-                     MAC2STR(info->src_addr));
-            if (wifi_now_add_peer(info->src_addr, s_channel)) {
-                wifi_now_save_peers();
-                // 发送配对请求给对方，交换名称信息
-                wifi_now_send_pair_request(info->src_addr);
+            // SLAVE角色只保留MASTER的MAC，不自动添加未知设备
+            if (role_control_get_role() != ROLE_BROADCAST) {
+                ESP_LOGI(TAG, "Auto-adding unknown sender as peer: " MACSTR,
+                         MAC2STR(info->src_addr));
+                if (wifi_now_add_peer(info->src_addr, s_channel)) {
+                    wifi_now_save_peers();
+                    // 发送配对请求给对方，交换名称信息
+                    wifi_now_send_pair_request(info->src_addr);
+                }
             }
         }
 
@@ -542,6 +548,12 @@ bool wifi_now_is_peer_exists(const uint8_t* mac_addr)
     return esp_now_is_peer_exist(mac_addr);
 }
 
+bool wifi_now_is_peer_cached(const uint8_t* mac_addr)
+{
+    if (s_state != WIFI_NOW_STATE_INIT || !mac_addr) return false;
+    return find_peer_in_cache(mac_addr) >= 0;
+}
+
 void wifi_now_clear_peers(void)
 {
     if (s_state != WIFI_NOW_STATE_INIT) return;
@@ -650,8 +662,14 @@ int wifi_now_broadcast(const uint8_t* data, int len)
 uint8_t wifi_now_get_channel(void)
 {
     if (s_state == WIFI_NOW_STATE_INIT) {
-        wifi_second_chan_t second_ch;
-        esp_wifi_get_channel(&s_channel, &second_ch);
+        // 只有 STA 已连接到 AP 时，才查询 esp_wifi_get_channel() 更新 s_channel
+        // 否则使用缓存的 s_channel（无 STA 时为 6），避免 ESP-NOW 初始化后
+        // WiFi 关联过程中 esp_wifi_get_channel() 返回临时信道导致 ESP_ERR_ESPNOW_CHAN
+        wifi_ap_record_t ap_info;
+        if (esp_wifi_sta_get_ap_info(&ap_info) == ESP_OK) {
+            wifi_second_chan_t second_ch;
+            esp_wifi_get_channel(&s_channel, &second_ch);
+        }
     }
     return s_channel;
 }
@@ -879,6 +897,79 @@ bool wifi_now_unpair_with_peer(const uint8_t* mac_addr)
     return true;
 }
 
+// ========== 一键解绑（UNBIND_ALL）==========
+
+bool wifi_now_unbind_all(void)
+{
+    if (!wifi_now_is_initialized()) {
+        ESP_LOGE(TAG, "ESP-NOW not initialized");
+        return false;
+    }
+
+    if (s_peer_cache_count == 0) {
+        ESP_LOGW(TAG, "No peers to unbind");
+        return true;
+    }
+
+    // 1. 向每个对端发送 UNBIND_ALL 消息
+    int sent_count = 0;
+    for (int i = 0; i < s_peer_cache_count; i++) {
+        esp_now_pair_msg_t msg;
+        memset(&msg, 0, sizeof(msg));
+        msg.magic = ESP_NOW_PAIR_MAGIC;
+        msg.type = ESP_NOW_MSG_UNBIND_ALL;
+        wifi_now_get_mac(msg.mac);
+        ble_pairing_get_name(msg.name);
+
+        int len = sizeof(esp_now_pair_msg_t);
+        int ret = wifi_now_send(s_peer_cache[i].mac, (const uint8_t*)&msg, len);
+        if (ret == 0) {
+            sent_count++;
+            ESP_LOGI(TAG, "Unbind-all sent to " MACSTR, MAC2STR(s_peer_cache[i].mac));
+        }
+    }
+
+    // 2. 等待消息发送完成
+    vTaskDelay(pdMS_TO_TICKS(200));
+
+    // 3. 清空本地 peer list
+    wifi_now_clear_peers();
+
+    ESP_LOGI(TAG, "Unbind-all complete: notified %d peers, local peers cleared", sent_count);
+    return true;
+}
+
+bool wifi_now_handle_unbind_all_message(const uint8_t* mac_addr, const uint8_t* data, int len)
+{
+    if (!mac_addr || !data || len < sizeof(esp_now_pair_msg_t)) {
+        return false;
+    }
+
+    esp_now_pair_msg_t* msg = (esp_now_pair_msg_t*)data;
+
+    if (msg->magic != ESP_NOW_PAIR_MAGIC) {
+        return false;
+    }
+
+    if (msg->type != ESP_NOW_MSG_UNBIND_ALL) {
+        return false;
+    }
+
+    ESP_LOGI(TAG, "Unbind-all command from " MACSTR " (name: %s)",
+             MAC2STR(msg->mac), msg->name);
+
+    // 收到一键解绑命令，清空本地 peer list
+    wifi_now_clear_peers();
+
+    if (s_unpair_cb) {
+        s_unpair_cb(msg->mac);
+    }
+
+    ESP_LOGI(TAG, "Local peer list cleared due to unbind-all from " MACSTR,
+             MAC2STR(msg->mac));
+    return true;
+}
+
 bool wifi_now_send_pair_response(const uint8_t* dest_mac)
 {
     if (!dest_mac || !wifi_now_is_initialized()) {
@@ -919,6 +1010,12 @@ bool wifi_now_handle_pair_message(const uint8_t* mac_addr, const uint8_t* data, 
     if (msg->type == ESP_NOW_MSG_PAIR_REQUEST) {
         ESP_LOGI(TAG, "Pair request from " MACSTR " (name: %s)",
                   MAC2STR(msg->mac), msg->name);
+
+        // SLAVE角色只保留MASTER的MAC，收到新MASTER的配对请求时清空旧peer
+        if (role_control_get_role() == ROLE_BROADCAST && !wifi_now_is_peer_exists(msg->mac)) {
+            ESP_LOGI(TAG, "SLAVE: clearing existing peers before adding new MASTER");
+            wifi_now_clear_peers();
+        }
 
         // 总是更新peer名称（包括已存在的peer），wifi_now_add_peer_with_name内部处理新建/更新
         wifi_now_add_peer_with_name(msg->mac, msg->channel, msg->name, msg->peer_type);
