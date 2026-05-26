@@ -268,6 +268,14 @@ S-->>C : "JSON 响应"
 
 ### 系统状态与重启 API
 - 端点
+  - GET /api/usb/napt
+    - 功能：查询 USB NAPT 开关状态
+    - 响应：JSON，`{"enabled": true/false}`
+  - POST /api/usb/napt
+    - 功能：开启/关闭 USB NAPT
+    - 请求体：application/x-www-form-urlencoded，字段 enable=0/1
+    - 响应：JSON，`{"success": true}`
+    - 说明：仅控制 USB 接口的 NAPT，AP NAPT 不受影响（始终跟随 STA 连接状态）
   - POST /api/restart
     - 功能：重启设备
     - 响应：JSON，success
@@ -391,6 +399,8 @@ USB --> HAL_USB["TinyUSB NCM"]
   - POST /api/espnow/send
   - POST /api/espnow/broadcast
 - 系统
+  - GET /api/usb/napt
+  - POST /api/usb/napt
   - POST /api/restart
 
 章节来源

@@ -157,6 +157,13 @@ static esp_err_t root_get_handler(httpd_req_t* req)
             .scan-list{max-height:260px}
         }
         @media(max-width:600px){.header h1{font-size:1.3em}.status-grid{grid-template-columns:1fr 1fr}.thr-grid{grid-template-columns:1fr}}
+        .ios-toggle{display:inline-flex;align-items:center;gap:12px;cursor:pointer;-webkit-user-select:none;user-select:none}
+        .ios-toggle input{display:none}
+        .ios-toggle .track{position:relative;width:51px;height:31px;background:#393a3f;border-radius:16px;transition:background .3s ease;flex-shrink:0}
+        .ios-toggle .track::after{content:'';position:absolute;top:2px;left:2px;width:27px;height:27px;background:#f0f0f0;border-radius:50%;transition:transform .3s cubic-bezier(0.25,0.1,0.25,1),background .3s ease;box-shadow:0 1px 4px rgba(0,0,0,.3)}
+        .ios-toggle input:checked+.track{background:#34c759}
+        .ios-toggle input:checked+.track::after{transform:translateX(20px);background:#fff}
+        .ios-toggle .label-text{color:#8892b0;font-size:clamp(11px,2.5vw,13px);line-height:1.3}
     </style>
 </head>
 <body>
@@ -280,7 +287,14 @@ static esp_err_t root_get_handler(httpd_req_t* req)
         </div>
 
         <div class="card">
-            <h2>USB Network</h2>
+            <h2 style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px">
+                <span>USB Network</span>
+                <label class="ios-toggle" style="gap:8px">
+                    <span class="label-text" style="font-size:clamp(10px,2vw,12px)">NAPT</span>
+                    <input type="checkbox" id="usbNaptToggle" onchange="toggleUsbNapt()">
+                    <span class="track"></span>
+                </label>
+            </h2>
             <p style="color:#8892b0;margin-bottom:8px">Plug USB to computer for automatic Ethernet device recognition</p>
             <div class="ip-box">ESP32 USB Management: <strong style="color:#e94560">http://192.168.5.1</strong></div>
         </div>
@@ -693,6 +707,22 @@ static esp_err_t root_get_handler(httpd_req_t* req)
         function restartDevice(){
             if(!confirm('Restart device?'))return;
             fetch('/api/restart',{method:'POST'}).then(function(){showToast('Restarting...','success')});
+        }
+
+        function toggleUsbNapt(){
+            var cb=document.getElementById('usbNaptToggle');
+            var enable=cb.checked;
+            fetch('/api/usb/napt',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'enable='+(enable?'1':'0')}).then(function(r){return r.json()}).then(function(d){
+                if(d.success){
+                    showToast('USB NAPT '+(enable?'enabled':'disabled'),'success');
+                }
+            }).catch(function(e){showToast('Toggle failed','error')});
+        }
+
+        function syncUsbNapt(){
+            fetch('/api/usb/napt').then(function(r){return r.json()}).then(function(d){
+                document.getElementById('usbNaptToggle').checked=d.enabled;
+            }).catch(function(e){});
         }
 
         function updateNowMac(){
@@ -1285,6 +1315,8 @@ static esp_err_t root_get_handler(httpd_req_t* req)
         setInterval(updateStatus,2000);
         updateDhcpClients();
         setInterval(updateDhcpClients,5000);
+        syncUsbNapt();
+        setInterval(syncUsbNapt,5000);
         updateNowMac();
         updateEspnowMaster();
         setInterval(updateEspnowMaster,5000);
@@ -1601,6 +1633,29 @@ static esp_err_t api_restart_handler(httpd_req_t* req)
     httpd_resp_send(req, "{\"success\":true}", HTTPD_RESP_USE_STRLEN);
     vTaskDelay(pdMS_TO_TICKS(500));
     esp_restart();
+    return ESP_OK;
+}
+
+static esp_err_t api_usb_napt_handler(httpd_req_t* req)
+{
+    if (req->method == HTTP_GET) {
+        char buf[32];
+        snprintf(buf, sizeof(buf), "{\"enabled\":%s}",
+                 wifi_service_get_usb_napt() ? "true" : "false");
+        httpd_resp_set_type(req, "application/json; charset=utf-8");
+        httpd_resp_send(req, buf, strlen(buf));
+    } else if (req->method == HTTP_POST) {
+        char content[32] = {0};
+        int ret = httpd_req_recv(req, content, sizeof(content) - 1);
+        if (ret <= 0) {
+            httpd_resp_send_500(req);
+            return ESP_FAIL;
+        }
+        bool enable = (strstr(content, "enable=1") != NULL);
+        wifi_service_set_usb_napt(enable);
+        httpd_resp_set_type(req, "application/json; charset=utf-8");
+        httpd_resp_send(req, "{\"success\":true}", HTTPD_RESP_USE_STRLEN);
+    }
     return ESP_OK;
 }
 
@@ -2960,7 +3015,7 @@ void web_server_start(WebServer* ws)
 {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.server_port      = 80;
-    config.max_uri_handlers = 39;
+    config.max_uri_handlers = 42;
     config.stack_size       = 16384;
 
     httpd_uri_t root_uri     = { .uri = "/", .method = HTTP_GET, .handler = root_get_handler, .user_ctx = NULL };
@@ -2970,6 +3025,8 @@ void web_server_start(WebServer* ws)
     httpd_uri_t ap_start_uri = { .uri = "/api/wifi/ap/start", .method = HTTP_POST, .handler = api_ap_start_handler, .user_ctx = NULL };
     httpd_uri_t ap_stop_uri  = { .uri = "/api/wifi/ap/stop", .method = HTTP_POST, .handler = api_ap_stop_handler, .user_ctx = NULL };
     httpd_uri_t restart_uri  = { .uri = "/api/restart", .method = HTTP_POST, .handler = api_restart_handler, .user_ctx = NULL };
+    httpd_uri_t usb_napt_get_uri = { .uri = "/api/usb/napt", .method = HTTP_GET, .handler = api_usb_napt_handler, .user_ctx = NULL };
+    httpd_uri_t usb_napt_set_uri = { .uri = "/api/usb/napt", .method = HTTP_POST, .handler = api_usb_napt_handler, .user_ctx = NULL };
     httpd_uri_t dhcp_uri     = { .uri = "/api/dhcp/clients", .method = HTTP_GET, .handler = api_dhcp_clients_handler, .user_ctx = NULL };
     httpd_uri_t scan_uri     = { .uri = "/api/wifi/scan", .method = HTTP_GET, .handler = api_wifi_scan_handler, .user_ctx = NULL };
     httpd_uri_t ble_status_uri = { .uri = "/api/ble/status", .method = HTTP_GET, .handler = api_ble_status_handler, .user_ctx = NULL };
@@ -3011,6 +3068,8 @@ void web_server_start(WebServer* ws)
         httpd_register_uri_handler(ws->server, &ap_start_uri);
         httpd_register_uri_handler(ws->server, &ap_stop_uri);
         httpd_register_uri_handler(ws->server, &restart_uri);
+        httpd_register_uri_handler(ws->server, &usb_napt_get_uri);
+        httpd_register_uri_handler(ws->server, &usb_napt_set_uri);
         httpd_register_uri_handler(ws->server, &dhcp_uri);
         httpd_register_uri_handler(ws->server, &scan_uri);
         httpd_register_uri_handler(ws->server, &ble_status_uri);

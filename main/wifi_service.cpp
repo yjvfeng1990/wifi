@@ -27,6 +27,7 @@ static const char* NVS_KEY_PASS = "password";
 static const char* NVS_KEY_MODE = "mode";
 static const char* NVS_KEY_AP_SSID = "ap_ssid";
 static const char* NVS_KEY_AP_PASS = "ap_pass";
+static const char* NVS_KEY_USB_NAPT = "usb_napt2";
 
 #define RSSI_TIMER_PERIOD_US    3000000
 #define STATS_TIMER_PERIOD_US   1000000
@@ -47,6 +48,7 @@ static char           s_sta_ip[16]      = "0.0.0.0";
 static int            s_sta_rssi        = 0;
 static bool           s_sta_was_connected = false;
 static bool           s_napt_enabled    = false;
+static bool           s_usb_napt_enabled = false;
 static int            s_ap_clients      = 0;
 static char           s_ap_ssid[33]     = DEFAULT_AP_SSID;
 static char           s_ap_password[65] = DEFAULT_AP_PASSWORD;
@@ -238,10 +240,17 @@ static void napt_callback(void* ctx)
 {
     napt_cb_ctx_t* c = (napt_cb_ctx_t*)ctx;
     if (c && c->nif) {
-        ip_napt_enable_netif(c->nif, c->enable);
-        ESP_LOGD(TAG, "NAPT: %s on %c%c%d",
-                 c->enable ? "enabled" : "disabled",
-                 c->nif->name[0], c->nif->name[1], c->nif->num);
+        int ret = ip_napt_enable_netif(c->nif, c->enable);
+        if (ret == 1) {
+            ESP_LOGI(TAG, "NAPT: %s on %c%c%d",
+                     c->enable ? "enabled" : "disabled",
+                     c->nif->name[0], c->nif->name[1], c->nif->num);
+        } else {
+            ESP_LOGW(TAG, "NAPT: FAILED to %s on %c%c%d (ret=%d, netif_is_up=%d)",
+                     c->enable ? "enable" : "disable",
+                     c->nif->name[0], c->nif->name[1], c->nif->num,
+                     ret, netif_is_up(c->nif));
+        }
     }
     free(ctx);
 }
@@ -253,9 +262,11 @@ static void enable_napt_for_netif(esp_netif_t* esp_netif)
     esp_netif_get_netif_impl_name(esp_netif, name);
     struct netif* nif = find_netif_by_name(name);
     if (!nif) {
-        ESP_LOGW(TAG, "NAPT: netif %s not found in netif_list", name);
+        ESP_LOGW(TAG, "NAPT: netif '%s' not found in netif_list", name);
         return;
     }
+    ESP_LOGI(TAG, "NAPT: enabling on '%s' (lwIP %c%c%d, up=%d)",
+             name, nif->name[0], nif->name[1], nif->num, netif_is_up(nif));
     napt_cb_ctx_t* ctx = (napt_cb_ctx_t*)calloc(1, sizeof(napt_cb_ctx_t));
     if (!ctx) return;
     ctx->nif    = nif;
@@ -285,11 +296,14 @@ static void enable_napt(void)
     }
 
     esp_netif_t* usb_netif = usb_network_get_netif();
-    enable_napt_for_netif(usb_netif);
+    if (s_usb_napt_enabled) {
+        enable_napt_for_netif(usb_netif);
+    }
     enable_napt_for_netif(s_ap_netif);
 
     s_napt_enabled = true;
-    ESP_LOGD(TAG, "NAPT enabled: WiFi STA -> USB+AP sharing active");
+    ESP_LOGI(TAG, "NAPT enabled: USB=%s, AP=on",
+             s_usb_napt_enabled ? "on" : "off");
 }
 
 static void disable_napt(void)
@@ -578,8 +592,10 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base,
             xSemaphoreTake(s_dhcp_mutex, portMAX_DELAY);
             bool found = false;
             for (int i = 0; i < s_dhcp_client_count; i++) {
-                if (s_dhcp_clients[i].source == DHCP_CLIENT_SRC_USB &&
-                    memcmp(s_dhcp_clients[i].mac, evt->mac, 6) == 0) {
+                if (memcmp(s_dhcp_clients[i].mac, evt->mac, 6) == 0) {
+                    s_dhcp_clients[i].source = (evt->esp_netif == s_ap_netif)
+                                               ? DHCP_CLIENT_SRC_AP
+                                               : DHCP_CLIENT_SRC_USB;
                     snprintf(s_dhcp_clients[i].ip, sizeof(s_dhcp_clients[i].ip),
                              IPSTR, IP2STR(&evt->ip));
                     found = true;
@@ -596,7 +612,7 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base,
             }
             xSemaphoreGive(s_dhcp_mutex);
 
-            ESP_LOGD(TAG, "DHCP assigned: " MACSTR " -> " IPSTR " (%s)",
+            ESP_LOGI(TAG, "DHCP assigned: " MACSTR " -> " IPSTR " (%s)",
                      MAC2STR(evt->mac), IP2STR(&evt->ip),
                      (evt->esp_netif == s_ap_netif) ? "AP" : "USB");
         }
@@ -623,6 +639,19 @@ void wifi_service_init(void)
         ret = nvs_flash_init();
     }
     ESP_ERROR_CHECK(ret);
+
+    // Load USB NAPT setting from NVS
+    nvs_handle_t nvs_handle;
+    if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &nvs_handle) == ESP_OK) {
+        // Clean up old key name
+        nvs_erase_key(nvs_handle, "usb_napt");
+        uint8_t val = 0;
+        if (nvs_get_u8(nvs_handle, NVS_KEY_USB_NAPT, &val) == ESP_OK) {
+            s_usb_napt_enabled = (val != 0);
+        }
+        nvs_commit(nvs_handle);
+        nvs_close(nvs_handle);
+    }
 
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
@@ -1010,6 +1039,35 @@ void wifi_service_get_dhcp_clients_json(char* buffer, size_t buffer_size)
                         clients[i].ip);
     }
     snprintf(buffer + pos, buffer_size - pos, "]");
+}
+
+void wifi_service_set_usb_napt(bool enable)
+{
+    s_usb_napt_enabled = enable;
+
+    // Save to NVS
+    nvs_handle_t nvs_handle;
+    if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &nvs_handle) == ESP_OK) {
+        nvs_set_u8(nvs_handle, NVS_KEY_USB_NAPT, enable ? 1 : 0);
+        nvs_commit(nvs_handle);
+        nvs_close(nvs_handle);
+    }
+
+    esp_netif_t* usb_netif = usb_network_get_netif();
+    if (!usb_netif) return;
+
+    if (enable) {
+        enable_napt_for_netif(usb_netif);
+        ESP_LOGI(TAG, "USB NAPT enabled");
+    } else {
+        disable_napt_for_netif(usb_netif);
+        ESP_LOGI(TAG, "USB NAPT disabled");
+    }
+}
+
+bool wifi_service_get_usb_napt(void)
+{
+    return s_usb_napt_enabled;
 }
 
 static int compare_rssi(const void* a, const void* b)

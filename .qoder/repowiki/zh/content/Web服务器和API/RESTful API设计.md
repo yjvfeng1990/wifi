@@ -284,6 +284,19 @@ EventDispatcher --> WiFiHW
 - 功能：重启设备
 - 响应：`{"success": true}`
 
+**USB NAPT开关接口**
+- 方法：GET
+- 路径：`/api/usb/napt`
+- 功能：查询 USB NAPT 开关状态
+- 响应：`{"enabled": true/false}`
+
+- 方法：POST
+- 路径：`/api/usb/napt`
+- 请求体：`enable=0/1`
+- 功能：开启或关闭 USB NAPT
+- 响应：`{"success": true}`
+- 说明：仅控制 USB 接口的 NAPT，AP NAPT 不受此接口影响（AP NAPT 始终跟随 STA 连接状态）
+
 #### BLE配对API
 
 **BLE状态查询接口**

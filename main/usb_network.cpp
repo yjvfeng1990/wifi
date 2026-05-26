@@ -129,9 +129,10 @@ static void dhcp_restart_timer_cb(void* arg)
 
     vTaskDelay(pdMS_TO_TICKS(200));
 
+    // 必须先设置选项再启动 server
+    apply_dhcp_options();
     ret = esp_netif_dhcps_start(s_usb_netif);
     if (ret == ESP_OK) {
-        apply_dhcp_options();
         ESP_LOGI(TAG, "DHCP server restarted, options applied");
     } else {
         ESP_LOGW(TAG, "DHCP start err: %d", ret);
@@ -269,8 +270,16 @@ esp_err_t usb_network_init(void)
         return ESP_FAIL;
     }
     esp_netif_set_mac(s_usb_netif, lwip_mac);
-    apply_dhcp_options();
+
+    // 先启动 netif，确保 DHCP server 处于运行状态后再施加选项
     esp_netif_action_start(s_usb_netif, NULL, 0, NULL);
+    vTaskDelay(pdMS_TO_TICKS(50));
+
+    // 显式重启 DHCP server，保证 options 在 server 运行后设置
+    esp_netif_dhcps_stop(s_usb_netif);
+    // 必须先设置 DHCP 选项再启动 server，否则 esp_netif_dhcps_option(OP_SET) 会返回 ALREADY_STARTED 错误
+    apply_dhcp_options();
+    esp_netif_dhcps_start(s_usb_netif);
 
     s_dhcp_started = true;
 

@@ -190,12 +190,14 @@ USB->>Tiny : 初始化NCM网络适配器
 Tiny-->>USB : 返回NCM初始化结果
 USB->>Net : 创建esp_netif实例
 Net-->>USB : 返回网络接口句柄
-USB->>Net : 配置DHCP选项
-Net-->>USB : 应用DHCP配置
+USB->>DHCP : 停止DHCP服务器
+USB->>DHCP : 配置DHCP选项（DNS、租期等）
 USB->>DHCP : 启动DHCP服务器
 DHCP-->>USB : 返回启动结果
 USB-->>Main : 返回初始化完成
 ```
+
+**重要：** DHCP 选项（包括 DNS）的配置必须在 `dhcps_stop()` 和 `dhcps_start()` 之间完成。`esp_netif_dhcps_option(OP_SET)` 在 DHCP 服务器运行时会返回 `ESP_ERR_ESP_NETIF_DHCP_ALREADY_STARTED` 拒绝执行。
 
 **图表来源**
 - [usb_network.cpp:191-290](file://main/usb_network.cpp#L191-L290)
@@ -295,7 +297,35 @@ APSTA --> LAN
 
 #### NAPT网络地址转换
 
-系统集成了NAPT功能，实现不同网络接口之间的数据包转换：
+系统集成了NAPT功能，实现不同网络接口之间的数据包转换。
+
+##### NAPT控制策略
+
+NAPT 遵循"LAN 接口开启 NAPT，WAN 接口不开启"的原则：
+
+| 接口 | 角色 | NAPT状态 | 控制方式 |
+|------|------|----------|----------|
+| **WiFi STA** | WAN（上游） | **关闭** | 固定，不可控制 |
+| **WiFi AP** | LAN（下游） | STA连接时**自动开启**，断开时**自动关闭** | 无独立开关 |
+| **USB NCM** | LAN（下游） | 默认**关闭** | Web API 独立开关（NVS 持久化） |
+
+**AP NAPT 触发时机**：
+
+```mermaid
+stateDiagram-v2
+[*] --> STADisconnected : 系统启动
+STADisconnected --> STAGotIP : STA获取IP
+STAGotIP --> NAPTActive : 自动开启NAPT(AP + USB)
+NAPTActive --> STADisconnected : STA断开
+STADisconnected --> STAGotIP : STA重连
+NAPTActive --> NAPTActive : AP/USB启停不影响
+```
+
+- AP NAPT 在 `IP_EVENT_STA_GOT_IP` 事件中触发（[wifi_service.cpp:586-588](file://main/wifi_service.cpp#L586-L588)）
+- STA 断开时 `WIFI_EVENT_STA_DISCONNECTED` 事件中调用 `disable_napt()`（[wifi_service.cpp:466](file://main/wifi_service.cpp#L466)）
+- USB NAPT 通过 Web API `POST /api/usb/napt` 独立控制（[wifi_service.cpp:1044-1066](file://main/wifi_service.cpp#L1044-L1066)）
+
+##### NAPT 数据流
 
 ```mermaid
 sequenceDiagram
@@ -558,6 +588,19 @@ MonHandler --> Stats[统计收集器]
 - 清理NAPT缓存
 - 检查网络路由配置
 - 重新配置NAPT规则
+
+#### DNS解析失败
+
+**症状**：USB或AP客户端自动获取DNS后无法解析域名，ping IP可以通但域名不行
+
+**根因**：`usb_network.cpp` 中 `apply_dhcp_options()` 在 `esp_netif_dhcps_start()` 之后调用，导致 `esp_netif_dhcps_option(OP_SET, DNS)` 因 DHCP 服务器已运行而静默失败（返回 `ESP_ERR_ESP_NETIF_DHCP_ALREADY_STARTED`）。DHCP 服务器 fallback 到用自己的 IP（`192.168.5.1`）作为 DNS，但 ESP32 不运行 DNS 代理，导致 DNS 查询全部失败。
+
+**诊断**：
+1. 在 Windows 上运行 `ipconfig /all`，查看 USB 网卡的 DNS 服务器地址
+2. 如果 DNS 为 `192.168.5.1` 而不是 `8.8.8.8`，则存在此问题
+3. 手动设置 DNS 为 `8.8.8.8` 后网页可正常访问
+
+**解决方案**：将 `apply_dhcp_options()` 调用移到 `esp_netif_dhcps_start()` 之前，确保 DHCP 选项在服务器启动前完成配置。
 
 ### 系统监控和调试
 

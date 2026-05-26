@@ -87,6 +87,9 @@ void wifi_service_stop_ap(void);
 bool wifi_service_is_ap_active(void);
 void wifi_service_get_ap_config(char* ssid, size_t ssid_len, char* password, size_t pass_len);
 
+void wifi_service_set_usb_napt(bool enable);
+bool wifi_service_get_usb_napt(void);
+
 void wifi_service_post_connect(const char* ssid, const char* password);
 void wifi_service_post_set_mode(wifi_op_mode_t mode);
 void wifi_service_post_start_ap(const char* ssid, const char* password);

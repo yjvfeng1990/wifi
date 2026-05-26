@@ -419,7 +419,7 @@ AP模式的关键功能：
 
 1. **客户端管理**：实时跟踪AP客户端连接状态和统计数据
 2. **DHCP服务**：自动分配IP地址和DNS配置
-3. **NAPT支持**：实现网络地址转换，允许客户端访问互联网
+3. **NAPT支持**：实现网络地址转换，允许客户端访问互联网。AP 的 NAPT 在 STA 连接时自动开启（无需独立开关），USB 的 NAPT 通过 Web API 单独控制
 4. **动态配置**：支持运行时修改AP配置参数
 
 **章节来源**
@@ -848,6 +848,20 @@ wifi_now_broadcast(data, data_len);
 3. **扫描参数**：扫描类型、扫描时间、结果排序
 4. **统计周期**：吞吐量统计的时间间隔
 5. **NAPT设置**：网络地址转换的启用状态
+
+### NAPT控制策略
+
+NAPT 控制策略区分 AP 和 USB 两个下游接口：
+
+| 接口 | NAPT行为 | 控制方式 |
+|------|----------|----------|
+| **AP**（`192.168.4.0/24`） | STA 连接 WiFi 后自动开启，STA 断开时自动关闭 | 无独立开关 |
+| **USB**（`192.168.5.0/24`） | 默认关闭，可通过 Web API 独立控制 | `POST /api/usb/napt` + NVS 持久化 |
+
+**触发流程**：
+- STA 获取 IP → `IP_EVENT_STA_GOT_IP` → `enable_napt()` → 开启 AP 和 USB 的 NAPT
+- STA 断开 → `WIFI_EVENT_STA_DISCONNECTED` → `disable_napt()` → 关闭 AP 和 USB 的 NAPT
+- USB NAPT 独立开关仅调用 `enable_napt_for_netif(usb_netif)`，不影响 AP
 
 ### 最佳实践
 

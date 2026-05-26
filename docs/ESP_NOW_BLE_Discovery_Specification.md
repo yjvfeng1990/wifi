@@ -1,8 +1,8 @@
 # ESP-NOW BLE Discovery and Pairing Service Specification
 ## ESP32-S3 WiFi Manager BLE Discovery Service Specification
 
-**Document Version:** 3.0  
-**Last Updated:** 2026-05-18  
+**Document Version:** 4.0  
+**Last Updated:** 2026-05-25  
 **Target Platform:** ESP32-S3 (ESP-IDF v6.0.1)
 
 ---
@@ -50,6 +50,14 @@ This document describes the BLE-based discovery and automatic pairing service fo
 - **Bidirectional peer removal** - both devices remove each other
 - **Unpair callback mechanism** - notify application layer of unpair events
 - **Persistent unpairing** - unpair status persists across reboots
+
+**What's New in v4.0:**
+- **Extended BLE advertising format** - added Version, Channel, Peer Type fields
+- **Dynamic PMK sync** - auto-generated PMK exchanged via pair messages
+- **Scan retry mechanism** - automatic rescan for ESP32-S3 BLE controller bug workaround
+- **UNBIND_ALL protocol** - remove all peers with a single message
+- **Expanded data structures** - channel and peer_type in discovery and peer info
+- **New BLE API functions** - burst advertising, controller reset, state query
 
 ---
 
@@ -104,16 +112,22 @@ The device broadcasts the following data in BLE advertising packets:
 
 | Offset | Length | Field | Description |
 |--------|--------|-------|-------------|
-| 0 | 2 | Manufacturer ID | `0x02E5` (Espressif Systems) |
-| 2 | 2 | Protocol Marker | `"EN"` (0x45, 0x4E) - ESP-NOW Marker |
+| 0 | 2 | Manufacturer ID | `0x02E5` (Espressif) |
+| 2 | 2 | Protocol Marker | `"EN"` (0x45, 0x4E) |
 | 4 | 6 | ESP-NOW MAC | Device's WiFi MAC address |
-| 10+ | N | Device Name | UTF-8 encoded device name |
+| 10 | 1 | Version | Protocol version (currently 1) |
+| 11 | 1 | Channel | Device's current WiFi channel |
+| 12 | 1 | Peer Type | `0`=WiFi, `1`=ESP-NOW |
+| 13+ | N | Device Name | UTF-8 encoded device name (max 19 bytes) |
 
 **Example Hex Dump:**
 ```
-02 E5      - Manufacturer ID (LE: 0x02E5)
-45 4E      - Protocol Marker ("EN")
+02 E5      - Manufacturer ID
+45 4E      - Protocol Marker ("EN")  
 3C 0F 02 D1 E6 94  - ESP-NOW MAC Address
+01         - Version = 1
+01         - Channel = 1
+01         - Peer Type = ESP-NOW
 45 53 50 33 32 2D  - Device Name ("ESP32-")
 53 33 2D 4E 4F 57  - Device Name ("S3-NOW")
 ```
@@ -141,11 +155,12 @@ The device broadcasts the following data in BLE advertising packets:
 |-----------|-------|-------------|
 | Advertising Type | Extended Advertising (Legacy Ind) | `ESP_BLE_GAP_SET_EXT_ADV_PROP_LEGACY_IND` |
 | Interval Min | 160 (100ms) | `adv_interval_min = 160` |
-| Interval Max | 160 (100ms) | `adv_interval_max = 160` |
+| Interval Max | 200 (125ms) | `adv_interval_max = 200` |
 | Channel Map | ALL (0x07) | Use all 3 channels |
 | Own Address Type | Public | Use public BLE address |
 | Primary PHY | 1M | `ESP_BLE_GAP_PHY_1M` |
 | Secondary PHY | 1M | `ESP_BLE_GAP_PHY_1M` |
+| scan_req_notif | `false` | Scan request notification disabled |
 
 ---
 
@@ -179,7 +194,7 @@ The device broadcasts the following data in BLE advertising packets:
 | Max Peers | 20 | Maximum registered peers |
 | Broadcast MAC | `FF:FF:FF:FF:FF:FF` | Broadcast address |
 | Default Channel | 1 | WiFi channel for ESP-NOW |
-| PMK | `"pmk1234567890123"` | Default PMK (if used) |
+| PMK | Auto-generated (random) | Auto-generated PMK for peer sync |
 
 ---
 
@@ -196,12 +211,17 @@ The automatic pairing protocol enables bidirectional peer addition between devic
 
 ```c
 typedef struct {
-    uint32_t magic;        // 0x4553504E ("ESPN")
-    uint8_t  type;         // PAIR_REQUEST (0x01) or PAIR_RESPONSE (0x02)
-    uint8_t  mac[6];       // Sender's ESP-NOW MAC
-    char     name[32];     // Device name (null-terminated)
+    uint32_t magic;          // 0x4553504E ("ESPN")
+    uint8_t  type;           // Message type (0x01-0x06, 0x10)
+    uint8_t  mac[6];         // Sender's ESP-NOW MAC
+    uint8_t  channel;        // Sender's current WiFi channel
+    uint8_t  peer_type;      // Peer type (PEER_TYPE_WIFI=0, PEER_TYPE_ESPNOW=1)
+    char     name[32];       // Device name (null-terminated)
+    uint8_t  pmk[16];        // Auto-generated PMK for peer sync
 } __attribute__((packed)) esp_now_pair_msg_t;
 ```
+
+**Size:** The structure is now **63 bytes** (increased from 43 bytes in v3.0).
 
 **Message Types:**
 
@@ -209,6 +229,10 @@ typedef struct {
 |------|-------|-------------|
 | PAIR_REQUEST | 0x01 | Request to add sender as peer |
 | PAIR_RESPONSE | 0x02 | Response accepting peer addition |
+| UNPAIR_REQUEST | 0x03 | Request to unpair |
+| UNPAIR_RESPONSE | 0x04 | Response confirming unpair |
+| ACK | 0x05 | Application-layer ACK |
+| UNBIND_ALL | 0x06 | Unbind all peers (v4.0) |
 | DATA | 0x10 | Regular data message |
 
 ### 5.3 Auto-Pairing Flow
@@ -230,16 +254,27 @@ Device A (Broadcaster)                Device B (Scanner)
       │                                     │    [Magic: ESPN]
       │                                     │    [Type: PAIR_REQUEST]
       │                                     │    [MAC: B_MAC]
+      │                                     │    [Channel: B_channel]
+      │                                     │    [Peer Type: B_type]
+      │                                     │    [PMK: auto-generated]
       │                                     │
       │ 6. Parse PAIR_REQUEST               │
-      │ 7. Add scanner as peer              │
+      │ 7. Record channel, peer_type, PMK   │
+      │ 8. Add scanner as peer              │
       │    wifi_now_add_peer(B_MAC, channel)│
       │                                     │
-      │ 8. Send PAIR_RESPONSE via ESP-NOW   │
+      │ 9. Send PAIR_RESPONSE via ESP-NOW   │
       │ ─────────────────────────────────►│
+      │    [Magic: ESPN]                    │
+      │    [Type: PAIR_RESPONSE]            │
+      │    [MAC: A_MAC]                     │
+      │    [Channel: A_channel]             │
+      │    [Peer Type: A_type]              │
+      │    [PMK: auto-generated]            │
       │                                     │
-      │                                     │ 9. Parse PAIR_RESPONSE
-      │                                     │ 10. Save peers to NVS
+      │                                     │ 10. Parse PAIR_RESPONSE
+      │                                     │ 11. Record channel, peer_type, PMK
+      │                                     │ 12. Save peers to NVS
       │                                     │
       ✓ Bidirectional ESP-NOW connection    ✓
          established successfully
@@ -329,23 +364,16 @@ The automatic unpairing protocol enables bidirectional peer removal between pair
 
 ### 6.2 Unpair Message Structure
 
-The unpair protocol uses the same message structure as pairing:
+The unpair protocol uses the same message structure as pairing (see Section 5.2), which now includes `channel`, `peer_type`, and `pmk` fields.
 
-```c
-typedef struct {
-    uint32_t magic;        // 0x4553504E ("ESPN")
-    uint8_t  type;         // UNPAIR_REQUEST (0x03) or UNPAIR_RESPONSE (0x04)
-    uint8_t  mac[6];       // Sender's ESP-NOW MAC
-    char     name[32];     // Device name (null-terminated)
-} __attribute__((packed)) esp_now_pair_msg_t;
-```
-
-**Message Types (v3.0):**
+**Message Types (v3.0/v4.0):**
 
 | Type | Value | Description |
 |------|-------|-------------|
 | UNPAIR_REQUEST | 0x03 | Request to unpair, remove sender as peer |
 | UNPAIR_RESPONSE | 0x04 | Response confirming unpair completion |
+| ACK | 0x05 | Application-layer ACK |
+| UNBIND_ALL | 0x06 | Unbind all peers (v4.0) |
 
 ### 6.3 Unpairing Flow
 
@@ -503,12 +531,28 @@ if (wifi_now_is_peer_exists(peer_mac)) {
 
 | Parameter | Value | Description |
 |-----------|-------|-------------|
-| Scan Type | Active | `BLE_SCAN_TYPE_ACTIVE` |
-| Scan Interval | 80 (50ms) | Time between scans |
-| Scan Window | 48 (30ms) | Active scan duration |
-| Duplicate Filter | Disabled | Report all devices |
+| Scan Type | Active (first), Passive (retries) | First scan active, retries use passive |
+| Scan Interval | 160 (100ms) | Time between scans |
+| Scan Window | 80 (50ms) | Active scan duration |
+| Duplicate Filter | Enabled | `BLE_SCAN_DUPLICATE_ENABLE` |
 | Filter Policy | Allow All | No whitelist/blacklist |
-| Default Scan Duration | 10 seconds | Scan time before auto-stop |
+| Default Scan Duration | 60 seconds (configurable) | Scan time before auto-stop |
+
+### 6.3 BLE Scan Retry Mechanism (v4.0)
+
+ESP32-S3 BLE controller 存在内部状态机问题，在密集 BLE 环境中可能交替丢失设备。
+本系统实现了自动补扫机制来解决此问题：
+
+**补扫策略：**
+- 扫描结束后检查发现设备数量
+- 若设备数量少于 2 个且未达到最大重试次数，自动进行补扫
+- 每次补扫前执行 BLE controller 硬复位（清除状态机）
+- 补扫使用被动扫描模式（Passive），减轻干扰
+
+**参数：**
+- `MAX_SCAN_RETRIES` = 3 — 最大补扫次数
+- `RETRY_SCAN_DURATION` = 30s — 每次补扫持续时间
+- BLE controller 复位：disable/enable BT controller + Bluedroid
 
 ---
 
@@ -749,12 +793,12 @@ Stop BLE advertising.
 
 #### `ble_pairing_start_scan()`
 ```c
-bool ble_pairing_start_scan(uint8_t duration_sec);
+bool ble_pairing_start_scan(uint16_t duration_sec);
 ```
 Start BLE scanning for ESP-NOW devices with automatic pairing.
 
 **Parameters:**
-- `duration_sec` - Scan duration in seconds (max 255)
+- `duration_sec` - Scan duration in seconds (max 65535)
 
 **Returns:** `true` on success, `false` on failure
 
@@ -823,6 +867,61 @@ Get the device's BLE advertising name.
 **Parameters:**
 - `name_out` - Buffer to store device name (must be at least 32 bytes)
 
+#### `ble_pairing_get_state()`
+```c
+ble_pairing_state_t ble_pairing_get_state(void);
+```
+Get current BLE pairing state.
+
+**Returns:** Current state (`OFF`, `ADVERTISING`, `SCANNING`, or `ERROR`)
+
+#### `ble_pairing_start_adv_burst()`
+```c
+bool ble_pairing_start_adv_burst(const char* name, uint16_t duration_sec);
+```
+Start timed burst advertising.
+
+**Parameters:**
+- `name` - Device name for advertising
+- `duration_sec` - Duration in seconds for the burst
+
+**Returns:** `true` on success, `false` on failure
+
+#### `ble_pairing_stop_adv_burst()`
+```c
+bool ble_pairing_stop_adv_burst(void);
+```
+Stop burst advertising.
+
+**Returns:** `true` on success, `false` on failure
+
+#### `ble_pairing_is_burst_mode()`
+```c
+bool ble_pairing_is_burst_mode(void);
+```
+Check if currently in burst advertising mode.
+
+**Returns:** `true` if in burst mode, `false` otherwise
+
+#### `ble_pairing_set_name()`
+```c
+bool ble_pairing_set_name(const char* name);
+```
+Set and persist device BLE name to NVS.
+
+**Parameters:**
+- `name` - Device name to set (max 32 bytes)
+
+**Returns:** `true` on success, `false` on failure
+
+#### `ble_pairing_reset_controller()`
+```c
+void ble_pairing_reset_controller(void);
+```
+Hard-reset BLE controller (workaround for ESP32-S3 BLE scan bug).
+
+**Note:** This function disables and re-enables both BT controller and Bluedroid to clear the internal state machine. Used internally by the scan retry mechanism (see Section 6.3).
+
 ### 8.2 ESP-NOW API
 
 #### `wifi_now_init()`
@@ -851,7 +950,7 @@ Add an ESP-NOW peer.
 
 #### `wifi_now_add_peer_with_name()`
 ```c
-bool wifi_now_add_peer_with_name(const uint8_t* mac_addr, uint8_t channel, const char* name);
+bool wifi_now_add_peer_with_name(const uint8_t* mac_addr, uint8_t channel, const char* name, uint8_t peer_type);
 ```
 Add an ESP-NOW peer with name.
 
@@ -859,6 +958,7 @@ Add an ESP-NOW peer with name.
 - `mac_addr` - 6-byte peer MAC address
 - `channel` - WiFi channel (1-14)
 - `name` - Peer name (max 32 bytes)
+- `peer_type` - Peer type (`PEER_TYPE_WIFI`=0 or `PEER_TYPE_ESPNOW`=1)
 
 **Returns:** `true` on success, `false` on failure
 
@@ -1056,14 +1156,17 @@ For implementing this protocol on other platforms:
 When building the advertising packet:
 
 ```c
-// Manufacturer Data Structure
+// Manufacturer Data Structure (v4.0 format)
 uint8_t mfg_data[32];
-mfg_data[0] = 0xE5;  // MFG ID LSB (0x02E5)
-mfg_data[1] = 0x02;  // MFG ID MSB
-mfg_data[2] = 'E';   // Protocol Marker
-mfg_data[3] = 'N';   // Protocol Marker
+mfg_data[0] = 0xE5;              // MFG ID LSB (0x02E5)
+mfg_data[1] = 0x02;              // MFG ID MSB
+mfg_data[2] = 'E';               // Protocol Marker
+mfg_data[3] = 'N';               // Protocol Marker
 memcpy(&mfg_data[4], espnow_mac, 6);  // ESP-NOW MAC
-strcpy(&mfg_data[10], device_name);    // Device Name
+mfg_data[10] = 0x01;             // Version = 1
+mfg_data[11] = wifi_channel;     // Current WiFi channel
+mfg_data[12] = peer_type;        // Peer type (0=WiFi, 1=ESP-NOW)
+strcpy(&mfg_data[13], device_name);  // Device Name
 ```
 
 #### BLE Scanning
@@ -1071,13 +1174,16 @@ strcpy(&mfg_data[10], device_name);    // Device Name
 When parsing scan response:
 
 ```c
-// Parse manufacturer data from scan result
-if (ad_type == 0xFF && data_len >= 12) {
+// Parse manufacturer data from scan result (v4.0 format)
+if (ad_type == 0xFF && data_len >= 13) {
     uint16_t mfg_id = data[0] | (data[1] << 8);
     if (mfg_id == 0x02E5 && data[2] == 'E' && data[3] == 'N') {
         // Valid ESP-NOW device found
         memcpy(espnow_mac, &data[4], 6);
-        // Device name starts at data[10]
+        uint8_t version = data[10];       // Protocol version
+        uint8_t channel = data[11];       // WiFi channel
+        uint8_t peer_type = data[12];     // Peer type
+        // Device name starts at data[13]
     }
 }
 ```
@@ -1085,12 +1191,15 @@ if (ad_type == 0xFF && data_len >= 12) {
 #### Auto-Pairing Message Format
 
 ```c
-// PAIR_REQUEST message
+// PAIR_REQUEST message (v4.0 format)
 typedef struct {
-    uint32_t magic;     // 0x4553504E ("ESPN")
-    uint8_t  type;      // 0x01 (PAIR_REQUEST)
-    uint8_t  mac[6];    // Sender's ESP-NOW MAC
-    char     name[32];  // Device name
+    uint32_t magic;          // 0x4553504E ("ESPN")
+    uint8_t  type;           // 0x01 (PAIR_REQUEST)
+    uint8_t  mac[6];         // Sender's ESP-NOW MAC
+    uint8_t  channel;        // Sender's current WiFi channel
+    uint8_t  peer_type;      // Peer type (0=WiFi, 1=ESP-NOW)
+    char     name[32];       // Device name
+    uint8_t  pmk[16];        // Auto-generated PMK for peer sync
 } esp_now_pair_msg_t;
 
 // Send via ESP-NOW
@@ -1109,6 +1218,8 @@ typedef struct {
     uint8_t now_mac[6];  // ESP-NOW MAC address
     char    name[32];    // Device name
     int     rssi;        // Signal strength
+    uint8_t channel;     // Peer's WiFi channel
+    uint8_t peer_type;   // Peer type (0=WiFi, 1=ESP-NOW)
 } ble_discovered_device_t;
 ```
 
@@ -1119,6 +1230,7 @@ typedef struct {
     uint8_t mac[6];      // Peer MAC address
     int     channel;     // WiFi channel
     char    name[32];    // Peer name
+    uint8_t peer_type;   // Peer type (0=WiFi, 1=ESP-NOW)
 } wifi_now_peer_info_t;
 ```
 
@@ -1127,14 +1239,24 @@ typedef struct {
 ```c
 #define ESP_NOW_MSG_PAIR_REQUEST   0x01
 #define ESP_NOW_MSG_PAIR_RESPONSE  0x02
+#define ESP_NOW_MSG_UNPAIR_REQUEST 0x03
+#define ESP_NOW_MSG_UNPAIR_RESPONSE 0x04
+#define ESP_NOW_MSG_ACK            0x05
+#define ESP_NOW_MSG_UNBIND_ALL     0x06
 #define ESP_NOW_MSG_DATA           0x10
 #define ESP_NOW_PAIR_MAGIC         0x4553504E  // "ESPN"
 
+#define PEER_TYPE_WIFI             0
+#define PEER_TYPE_ESPNOW           1
+
 typedef struct {
-    uint32_t magic;        // Magic number: 0x4553504E
-    uint8_t  type;         // Message type
-    uint8_t  mac[6];       // Sender's ESP-NOW MAC
-    char     name[32];     // Device name
+    uint32_t magic;          // Magic number: 0x4553504E
+    uint8_t  type;           // Message type (0x01-0x06, 0x10)
+    uint8_t  mac[6];         // Sender's ESP-NOW MAC
+    uint8_t  channel;        // Sender's current WiFi channel
+    uint8_t  peer_type;      // Peer type (PEER_TYPE_WIFI=0, PEER_TYPE_ESPNOW=1)
+    char     name[32];       // Device name (null-terminated)
+    uint8_t  pmk[16];        // Auto-generated PMK for peer sync
 } __attribute__((packed)) esp_now_pair_msg_t;
 ```
 
@@ -1185,15 +1307,21 @@ typedef void (*wifi_now_pair_cb_t)(
 | `ESP_NOW_PAIR_MAGIC` | 0x4553504E | "ESPN" magic number |
 | `ESP_NOW_MSG_PAIR_REQUEST` | 0x01 | Pair request type |
 | `ESP_NOW_MSG_PAIR_RESPONSE` | 0x02 | Pair response type |
+| `ESP_NOW_MSG_UNPAIR_REQUEST` | 0x03 | Unpair request type |
+| `ESP_NOW_MSG_UNPAIR_RESPONSE` | 0x04 | Unpair response type |
+| `ESP_NOW_MSG_ACK` | 0x05 | Application-layer ACK |
+| `ESP_NOW_MSG_UNBIND_ALL` | 0x06 | Unbind all peers (v4.0) |
+| `PEER_TYPE_WIFI` | 0 | WiFi peer type |
+| `PEER_TYPE_ESPNOW` | 1 | ESP-NOW peer type |
 
 ### 11.3 BLE Parameters
 
 | Parameter | Value |
 |-----------|-------|
-| Advertising Interval | 100ms (160 * 0.625ms) |
-| Scan Interval | 50ms (80 * 0.625ms) |
-| Scan Window | 30ms (48 * 0.625ms) |
-| Default Scan Duration | 10 seconds |
+| Advertising Interval | 125ms (200 * 0.625ms) |
+| Scan Interval | 100ms (160 * 0.625ms) |
+| Scan Window | 50ms (80 * 0.625ms) |
+| Default Scan Duration | 60 seconds |
 
 ---
 
@@ -1216,14 +1344,26 @@ class ESPNowBLEAdvertiser {
 private:
     uint8_t m_espnow_mac[6];
     String m_device_name;
+    uint8_t m_channel;
+    uint8_t m_peer_type;
     
 public:
+    ESPNowBLEAdvertiser() : m_channel(1), m_peer_type(1) {}
+    
     void setMAC(const uint8_t* mac) {
         memcpy(m_espnow_mac, mac, 6);
     }
     
     void setName(const String& name) {
         m_device_name = name;
+    }
+    
+    void setChannel(uint8_t channel) {
+        m_channel = channel;
+    }
+    
+    void setPeerType(uint8_t type) {
+        m_peer_type = type;
     }
     
     std::vector<uint8_t> buildMFGData() {
@@ -1238,6 +1378,10 @@ public:
         for (int i = 0; i < 6; i++) {
             data.push_back(m_espnow_mac[i]);
         }
+        // Version, Channel, Peer Type (v4.0)
+        data.push_back(0x01);           // Version = 1
+        data.push_back(m_channel);      // WiFi channel
+        data.push_back(m_peer_type);    // Peer type
         // Device name
         for (char c : m_device_name) {
             data.push_back(c);
@@ -1252,11 +1396,14 @@ public:
 For STM32 with external BLE module:
 
 ```c
-// Build ESP-NOW advertisement
+// Build ESP-NOW advertisement (v4.0 format)
 typedef struct {
     uint16_t mfg_id;        // 0x02E5
     uint8_t  marker[2];     // "EN"
     uint8_t  espnow_mac[6]; // ESP-NOW MAC
+    uint8_t  version;       // Protocol version (currently 1)
+    uint8_t  channel;       // WiFi channel
+    uint8_t  peer_type;     // Peer type (0=WiFi, 1=ESP-NOW)
     char     name[];        // Variable length name
 } __attribute__((packed)) espnow_adv_data_t;
 ```
@@ -1270,12 +1417,15 @@ void send_pair_request(const uint8_t* dest_mac) {
     msg.magic = ESP_NOW_PAIR_MAGIC;  // 0x4553504E
     msg.type = ESP_NOW_MSG_PAIR_REQUEST;
     get_espnow_mac(msg.mac);
+    msg.channel = get_channel();
+    msg.peer_type = get_peer_type();
     get_device_name(msg.name);
+    generate_pmk(msg.pmk);  // Auto-generate PMK
     
     esp_now_send(dest_mac, (uint8_t*)&msg, sizeof(msg));
 }
 
-// Handle incoming pair message
+// Handle incoming pair message (v4.0)
 bool handle_pair_message(const uint8_t* src_mac, const uint8_t* data, int len) {
     if (len < sizeof(esp_now_pair_msg_t)) return false;
     
@@ -1284,9 +1434,11 @@ bool handle_pair_message(const uint8_t* src_mac, const uint8_t* data, int len) {
     if (msg->magic != ESP_NOW_PAIR_MAGIC) return false;
     
     if (msg->type == ESP_NOW_MSG_PAIR_REQUEST) {
-        // Add sender as peer
+        // Add sender as peer with channel, peer_type, pmk from message
         if (!is_peer_exists(msg->mac)) {
-            add_peer(msg->mac, get_channel(), msg->name);
+            add_peer(msg->mac, msg->channel, msg->name);
+            set_peer_type(msg->mac, msg->peer_type);
+            set_pmk(msg->pmk);
             save_peers();
         }
         // Send response
@@ -1299,9 +1451,11 @@ bool handle_pair_message(const uint8_t* src_mac, const uint8_t* data, int len) {
     }
     
     if (msg->type == ESP_NOW_MSG_PAIR_RESPONSE) {
-        // Add sender as peer
+        // Add sender as peer with channel, peer_type, pmk from message
         if (!is_peer_exists(msg->mac)) {
-            add_peer(msg->mac, get_channel(), msg->name);
+            add_peer(msg->mac, msg->channel, msg->name);
+            set_peer_type(msg->mac, msg->peer_type);
+            set_pmk(msg->pmk);
             save_peers();
         }
         // Notify callback
@@ -1366,6 +1520,7 @@ bool handle_pair_message(const uint8_t* src_mac, const uint8_t* data, int len) {
 | 1.0 | 2026-05-17 | System | Initial specification |
 | 2.0 | 2026-05-18 | System | Added auto-pairing protocol (v2.0) |
 | 3.0 | 2026-05-18 | System | Added unpairing protocol (v3.0) |
+| 4.0 | 2026-05-25 | System | Dynamic PMK sync, BLE advertising format v2, scan retry mechanism, UNBIND_ALL protocol, expanded data structures, new BLE API functions |
 
 ---
 

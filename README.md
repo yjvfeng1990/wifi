@@ -11,6 +11,9 @@ ESP32-S3 实现三接口网络共享，支持 STA/AP/USB 同时运行，STA 作�
 | **USB NCM** | 下游 (LAN) | Windows USB 网卡，DHCP+DNS 自动下发 |
 
 - **NAPT 共享上网**：AP 和 USB 客户端通过 STA 共享网络
+- **AP NAPT**：STA 连接 WiFi 后自动开启，STA 断开自动关闭，无独立开关
+- **USB NAPT**：通过 Web API `/api/usb/napt` 独立控制（默认关闭），NVS 持久化
+- **DHCP DNS**：USB 和 AP DHCP 服务器自动下发 `8.8.8.8` 作为 DNS
 - **双模共存**：STA + AP 同时运行，互不影响
 - **Web 管理页面**：配置 SSID/密码、扫描附近 WiFi、查看实时吞吐、切换模式
 - **WiFi 扫描**：异步后台扫描，轮询获取结果，按信号强度排序，点击自动填入 SSID
@@ -164,6 +167,8 @@ python -m esptool --chip esp32s3 -p COM2 -b 460800 --before default-reset --afte
 | POST | `/api/ble/scan` | 启动 BLE 设备扫描 |
 | GET | `/api/ble/devices` | 已发现的 BLE 设备列表 |
 | POST | `/api/ble/pair` | 与指定 BLE 设备配对 |
+| GET | `/api/usb/napt` | 查询 USB NAPT 状态 |
+| POST | `/api/usb/napt` | 开启/关闭 USB NAPT（`enable=0/1`） |
 | GET | `/api/now/mac` | 本机 ESP-NOW MAC |
 | GET | `/api/now/peers` | ESP-NOW Peer 列表 |
 | POST | `/api/now/peer/remove` | 移除指定 Peer |
@@ -223,7 +228,7 @@ SSID 可能包含 `"`、`&`、`'` 和不可见控制字符，直接拼入 HTML `
 
 `HTTPD_DEFAULT_CONFIG()` 默认 `max_uri_handlers = 8`。当注册超过 8 个路由时，`httpd_register_uri_handler()` 静默失败。已手动增大至 `config.max_uri_handlers = 24`。
 
-### DHCP DNS 选项格式（ESP-IDF v6.0.1）
+### DHCP DNS 选项格式与顺序（ESP-IDF v6.0.1）
 
 `esp_netif_dhcps_option(ESP_NETIF_DOMAIN_NAME_SERVER)` 的参数类型为 `uint8_t` 标志位（`0x02`），不是 DNS IP 地址。正确用法两步：
 
@@ -239,7 +244,9 @@ IP4_ADDR(&dns.ip.u_addr.ip4, 8, 8, 8, 8);
 esp_netif_set_dns_info(netif, ESP_NETIF_DNS_MAIN, &dns);
 ```
 
-必须在 `esp_netif_dhcps_stop()` 和 `esp_netif_dhcps_start()` 之间执行。
+必须在 `esp_netif_dhcps_stop()` 和 `esp_netif_dhcps_start()` **之间**执行。
+
+**bug：** `usb_network.cpp` 中 `apply_dhcp_options()` 原在 `dhcps_start()` 之后调用，导致 DNS 标志位设置请求被拒绝（`ESP_ERR_ESP_NETIF_DHCP_ALREADY_STARTED`），DHCP 服务器 fallback 到用自己的 IP（`192.168.5.1`）作为 DNS。Windows 自动获取 DNS 后因 ESP32 未运行 DNS 代理而无法解析域名。修复：将 `apply_dhcp_options()` 移到 `dhcps_start()` 之前。
 
 ### NAPT 线程安全
 
